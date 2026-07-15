@@ -13,28 +13,59 @@ pub fn router() -> Router<AppState> {
         .route("/api/ui/resolve", post(resolve))
 }
 
-/// Finds `publish_files` directories under (or equal to) `root`.
-/// Accepts: a direct publish_files, a game directory
-/// (`<game>/math/games/<id>/library/publish_files`), or the repo root
-/// (several games). Search bounded to a few levels, not a full walk.
+/// Finds every `publish_files` folder under (or equal to) `root`, whatever
+/// the layout: a publish_files itself, a game folder, a whole repo, a parent
+/// of several repos… Bounded breadth-first walk (depth + visited caps) that
+/// skips hidden/heavy directories, so picking a huge folder stays instant.
 pub fn resolve_publish_dirs(root: &Path) -> Vec<PathBuf> {
+    const MAX_DEPTH: u8 = 7;
+    const MAX_VISITED: usize = 30_000;
+    // Heavy or irrelevant directories. Note: macOS "Library" (capital L) is
+    // skipped, but the math-sdk "library" (lowercase, parent of
+    // publish_files) is NOT.
+    const SKIP: &[&str] = &[
+        "node_modules", "target", "dist", "build", "out", "Library",
+        "__pycache__", "venv", "env",
+    ];
+
     let mut found = Vec::new();
     if is_publish_dir(root) {
         found.push(root.to_path_buf());
         return found;
     }
-    // <root>/library/publish_files
-    let direct = root.join("library/publish_files");
-    if is_publish_dir(&direct) {
-        found.push(direct);
-    }
-    // <root>/math/games/*/library/publish_files (a game directory)
-    collect_under(&root.join("math/games"), &mut found);
-    // <root>/*/math/games/*/library/publish_files (repo root)
-    if let Ok(entries) = std::fs::read_dir(root) {
+    let mut visited = 0usize;
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0u8)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > MAX_VISITED {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
-            if e.path().is_dir() {
-                collect_under(&e.path().join("math/games"), &mut found);
+            // Don't follow symlinks (cycles, escapes outside the picked tree).
+            if e.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+                continue;
+            }
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // '_' prefix = backup/scratch convention (math-sdk backups,
+            // SlotLab's own _prebalance/…) — never offer those as games.
+            if name.starts_with('.')
+                || name.starts_with('_')
+                || SKIP.contains(&name.as_ref())
+            {
+                continue;
+            }
+            if is_publish_dir(&p) {
+                found.push(p); // don't descend inside a publish_files
+            } else if depth + 1 < MAX_DEPTH {
+                queue.push_back((p, depth + 1));
             }
         }
     }
@@ -47,26 +78,30 @@ fn is_publish_dir(p: &Path) -> bool {
     p.join("index.json").is_file()
 }
 
-fn collect_under(games_dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(games_dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let pf = e.path().join("library/publish_files");
-        if is_publish_dir(&pf) {
-            out.push(pf);
-        }
-    }
-}
-
-/// game_id from `.../math/games/<id>/library/publish_files`.
+/// Game name from a publish_files path. Tries, in order: the math-sdk
+/// pattern `…/math/games/<id>/library/publish_files`, the folder above
+/// `library/`, then the folder holding publish_files.
 pub fn game_id_from_path(p: &Path) -> Option<String> {
     let s = p.to_string_lossy();
-    s.split("/math/games/")
-        .nth(1)?
-        .split('/')
-        .next()
-        .map(|s| s.to_string())
+    if let Some(id) = s
+        .split("/math/games/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+    {
+        return Some(id.to_string());
+    }
+    let comps: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let n = comps.len();
+    if n >= 3 && comps[n - 1] == "publish_files" && comps[n - 2] == "library" {
+        return Some(comps[n - 3].clone());
+    }
+    if n >= 2 && comps[n - 1] == "publish_files" {
+        return Some(comps[n - 2].clone());
+    }
+    None
 }
 
 fn describe(paths: Vec<PathBuf>) -> Value {

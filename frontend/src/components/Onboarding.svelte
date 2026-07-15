@@ -52,6 +52,30 @@
     }
   }
 
+  /** Candidates not registered yet (by name or path). */
+  function freshOf(games: FoundGame[]): FoundGame[] {
+    return games.filter(
+      (g) => !app.games.some((x) => x.name === g.name || x.publishDir === g.path),
+    );
+  }
+
+  /** Single fresh game → add it right away; several → offer the list. */
+  async function handleFound(games: FoundGame[]) {
+    const fresh = freshOf(games);
+    if (fresh.length === 0) {
+      gameError =
+        games.length === 1
+          ? 'This game is already added.'
+          : `All ${games.length} games in this folder are already added.`;
+      return;
+    }
+    if (fresh.length === 1) {
+      await addOne(fresh[0].name, fresh[0].path);
+    } else {
+      candidates = fresh;
+    }
+  }
+
   async function browse() {
     gameError = null;
     candidates = [];
@@ -66,15 +90,30 @@
       if (games.length === 0) {
         publishDir = r.picked ?? '';
         gameError =
-          'No publish_files found in this folder. Pick a game folder (math-sdk layout) or its publish_files.';
-      } else if (games.length === 1) {
-        await addOne(games[0].name, games[0].path);
+          'No publish_files found in this folder. Pick a game folder (or any parent folder — SlotLab searches inside).';
       } else {
-        candidates = games;
+        await handleFound(games);
       }
     } catch (e) {
       gameError = e instanceof Error ? e.message : String(e);
     }
+  }
+
+  async function addAllCandidates() {
+    gameBusy = true;
+    gameError = null;
+    for (const c of [...candidates]) {
+      try {
+        await api.registerGame(c.name, c.path, '');
+        added = [...added, c.name];
+      } catch {
+        /* keep going */
+      }
+    }
+    await refreshGames();
+    if (added.length > 0) app.selectedGame = added[0];
+    candidates = [];
+    gameBusy = false;
   }
 
   async function addOne(name: string, path: string) {
@@ -102,15 +141,15 @@
     // Hand-typed path that isn't a publish_files itself → resolve it.
     gameBusy = true;
     gameError = null;
+    candidates = [];
     try {
       const r = await api.resolvePath(publishDir.trim());
-      if (r.games.length === 1) {
-        await addOne(r.games[0].name, r.games[0].path);
-      } else if (r.games.length > 1) {
-        candidates = r.games;
-      } else {
+      if (r.games.length === 0) {
         gameError =
-          'No publish_files found at this path. Point to a game folder or its …/library/publish_files.';
+          'No publish_files found at this path. Point to a game folder (or any parent folder).';
+      } else {
+        gameBusy = false;
+        await handleFound(r.games);
       }
     } catch (e) {
       gameError = e instanceof Error ? e.message : String(e);
@@ -210,9 +249,10 @@
         <p class="overline">Step 2 · Add your first game</p>
         <h2>Point SlotLab at a game's math</h2>
         <p>
-          Pick a game folder (math-sdk layout) or a whole repo — SlotLab finds
-          the <code>publish_files</code>, derives the name and imports the
-          books on its own.
+          Pick a game folder, a repo, or any parent folder — SlotLab digs out
+          every <code>publish_files</code> inside, derives the names and
+          imports the books on its own. Several games found = add them all in
+          one click.
         </p>
         <div class="add-row">
           <button onclick={browse} disabled={gameBusy}>📁 Browse…</button>
@@ -230,10 +270,21 @@
           </button>
         </div>
         {#if candidates.length > 0}
-          <p class="dim found">{candidates.length} games found — add the ones you want:</p>
+          <p class="dim found">
+            {candidates.length} games found:
+            <button class="primary" onclick={addAllCandidates} disabled={gameBusy}>
+              {gameBusy ? 'Adding…' : `Add all ${candidates.length}`}
+            </button>
+            <span class="dim">or pick them one by one —</span>
+          </p>
           <div class="chips">
             {#each candidates as c (c.path)}
-              <button class="chip-btn" onclick={() => addOne(c.name, c.path)} disabled={gameBusy}>
+              <button
+                class="chip-btn"
+                title={c.path}
+                onclick={() => addOne(c.name, c.path)}
+                disabled={gameBusy}
+              >
                 + {c.name}
               </button>
             {/each}
@@ -455,6 +506,9 @@
   }
 
   .found {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     margin: 14px 0 8px;
     font-size: 12.5px;
   }

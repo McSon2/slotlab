@@ -5,8 +5,33 @@
   let publishDir = $state('');
   let busy = $state(false);
   let formError = $state<string | null>(null);
+  let info = $state<string | null>(null);
   /** Multiple games found (repo root) → the user picks. */
   let candidates = $state<FoundGame[]>([]);
+
+  /** Candidates not registered yet (by name or path). */
+  function freshOf(games: FoundGame[]): FoundGame[] {
+    return games.filter(
+      (g) => !app.games.some((x) => x.name === g.name || x.publishDir === g.path),
+    );
+  }
+
+  /** Single fresh game → add it right away; several → offer the list. */
+  async function handleFound(games: FoundGame[]) {
+    const fresh = freshOf(games);
+    if (fresh.length === 0) {
+      info =
+        games.length === 1
+          ? 'This game is already added.'
+          : `All ${games.length} games in this folder are already added.`;
+      return;
+    }
+    if (fresh.length === 1) {
+      if (await addOne(fresh[0].name, fresh[0].path)) publishDir = '';
+    } else {
+      candidates = fresh;
+    }
+  }
 
   /** Derives the game_id from `<repo>/math/games/<id>/library/publish_files`. */
   const derivedName = $derived.by(() => {
@@ -16,6 +41,7 @@
 
   async function browse() {
     formError = null;
+    info = null;
     candidates = [];
     try {
       const r = await api.pickFolder();
@@ -28,11 +54,9 @@
       if (games.length === 0) {
         publishDir = r.picked ?? '';
         formError =
-          'No publish_files found in this folder. Pick a game folder or its publish_files.';
-      } else if (games.length === 1) {
-        publishDir = games[0].path;
+          'No publish_files found in this folder. Pick a game folder (or any parent folder — SlotLab searches inside).';
       } else {
-        candidates = games;
+        await handleFound(games);
       }
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);
@@ -71,23 +95,22 @@
   }
 
   async function register() {
-    // Hand-typed path that doesn't match → try to resolve it.
-    if (!derivedName) {
-      const r = await api.resolvePath(publishDir.trim());
-      if (r.games.length === 1) {
-        publishDir = r.games[0].path;
-      } else if (r.games.length > 1) {
-        candidates = r.games;
-        return;
-      } else {
-        formError =
-          'No publish_files found. Use "Browse" or provide a …/library/publish_files path.';
-        return;
-      }
+    formError = null;
+    info = null;
+    candidates = [];
+    // Fast path: the typed path is already a publish_files.
+    if (derivedName) {
+      if (await addOne(derivedName, publishDir.trim())) publishDir = '';
+      return;
     }
-    if (await addOne(derivedName, publishDir.trim())) {
-      publishDir = '';
+    // Otherwise resolve it (game folder, repo, any parent folder).
+    const r = await api.resolvePath(publishDir.trim());
+    if (r.games.length === 0) {
+      formError =
+        'No publish_files found. Use "Browse" or paste a game (or parent) folder path.';
+      return;
     }
+    await handleFound(r.games);
   }
 
   async function remove(gameName: string) {
@@ -122,17 +145,24 @@
       {busy ? 'Loading…' : derivedName ? `Add ${derivedName}` : 'Add'}
     </button>
   </div>
+  {#if info}
+    <p class="form-note">{info}</p>
+  {/if}
   {#if candidates.length > 0}
     <div class="candidates">
       <p class="dim">
         {candidates.length} games found in this folder:
-        <button class="ghost" onclick={addAllCandidates} disabled={busy}>
-          add all
+        <button class="primary" onclick={addAllCandidates} disabled={busy}>
+          {busy ? 'Adding…' : `Add all ${candidates.length}`}
         </button>
       </p>
       <div class="chips">
         {#each candidates as c (c.path)}
-          <button class="chip-btn" onclick={() => addOne(c.name, c.path).then((ok) => ok && (candidates = candidates.filter((x) => x.path !== c.path)))}>
+          <button
+            class="chip-btn"
+            title={c.path}
+            onclick={() => addOne(c.name, c.path).then((ok) => ok && (candidates = candidates.filter((x) => x.path !== c.path)))}
+          >
             + {c.name}
           </button>
         {/each}
@@ -243,6 +273,12 @@
 
   .form-error {
     color: var(--fail);
+    margin: 8px 0 0;
+    font-size: 12.5px;
+  }
+
+  .form-note {
+    color: var(--text-dim);
     margin: 8px 0 0;
     font-size: 12.5px;
   }
