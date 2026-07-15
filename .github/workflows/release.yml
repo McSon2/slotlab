@@ -1,0 +1,66 @@
+# Desktop app release: on a `v*` tag, builds a UNIVERSAL macOS binary
+# (Apple Silicon + Intel in one .dmg), signs + notarizes it with the Apple
+# Developer ID, and publishes a GitHub release.
+#
+# NOTE: GitHub only reads workflows at the REPO root — this file is active
+# once slotlab lives in its own (public) repository.
+#
+# Required repo secrets (same material as the SSP pipeline):
+#   APPLE_CERTIFICATE              base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD     password of the .p12
+#   APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: <name> (<team>)"
+#   APPLE_ID                       Apple ID email (notarization)
+#   APPLE_PASSWORD                 app-specific password (notarization)
+#   APPLE_TEAM_ID                  team identifier
+name: Release desktop app
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      # The UI is embedded into the binary at compile time (rust-embed on
+      # frontend/dist) — build it before the Rust build.
+      - name: Build frontend
+        run: pnpm --dir frontend install && pnpm --dir frontend build
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: crates/slotlab-desktop
+          args: --target universal-apple-darwin
+          tagName: v__VERSION__
+          releaseName: 'SlotLab v__VERSION__'
+          releaseBody: 'Download the .dmg below, open it and drag SlotLab into Applications.'
+          releaseDraft: true

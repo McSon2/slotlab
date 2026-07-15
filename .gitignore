@@ -1,0 +1,10 @@
+# Rust
+/target/
+
+# Frontend (dist is generated and embedded at compile time — build it first)
+node_modules/
+/frontend/dist/
+
+# OS / misc
+.DS_Store
+*.log

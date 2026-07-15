@@ -1,0 +1,40 @@
+[package]
+name = "slotlab-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "slotlab"
+path = "src/main.rs"
+
+[dependencies]
+slotlab-core = { path = "../slotlab-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rust-embed = { version = "8", optional = true }
+mime_guess = "2"
+zstd = "0.13"
+memmap2 = "0.9"
+lru = "0.12"
+bincode = "1"
+rand = "0.8"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+time = "0.3"
+async-stream = "0.3.6"
+futures-core = "0.3.32"
+rayon = "1.12.0"
+
+[features]
+default = []
+embed-ui = ["dep:rust-embed"]

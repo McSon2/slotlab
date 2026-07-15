@@ -1,0 +1,20 @@
+[package]
+name = "slotlab-desktop"
+version.workspace = true
+edition.workspace = true
+description = "SlotLab — dev/QA desktop app for Stake Engine slots"
+
+[[bin]]
+name = "slotlab-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+slotlab-app = { path = "../slotlab-app", features = ["embed-ui"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
