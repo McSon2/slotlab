@@ -17,6 +17,11 @@ pub struct GameEntry {
     /// (`<repo>/frontend/apps/<game>/build`), served under /games/<name>/.
     #[serde(default)]
     pub build_dir: Option<PathBuf>,
+    /// The game's frontend app folder (`<repo>/frontend/apps/<game>`), parent
+    /// of `src/`, `static/` and `build/`. Detected like `build_dir`, but it
+    /// exists before anything is built — the source checks need it.
+    #[serde(default)]
+    pub app_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

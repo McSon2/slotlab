@@ -10,7 +10,10 @@ use std::io::Write;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/ui/games/{name}/optimize/{mode}", get(feasibility).post(preview))
+        .route(
+            "/api/ui/games/{name}/optimize/{mode}",
+            get(feasibility).post(preview),
+        )
         .route("/api/ui/games/{name}/optimize/{mode}/apply", post(apply))
 }
 
@@ -47,15 +50,54 @@ async fn preview(
     let Some(game) = state.registry.get(&name) else {
         return Json(json!({ "error": "unknown game" }));
     };
-    let Some(m) = game.resolve_mode(&mode) else {
+    if game.resolve_mode(&mode).is_none() {
         return Json(json!({ "error": "unknown mode" }));
-    };
-    let result = optimizer::optimize(&m.lut, m.config.cost, &req);
-    let before = stats::analyze(&m.lut, m.config.cost);
-    // LUT rebuilt with the new weights for the "after" analysis.
-    let after_lut = rebuilt_lut(&m.lut, &result.weights);
-    let after = stats::analyze(&after_lut, m.config.cost);
-    Json(serde_json::to_value(PreviewResponse { result, before, after }).unwrap())
+    }
+    // Seconds of bisection on a big LUT: off the runtime.
+    let out = tokio::task::spawn_blocking(move || {
+        let m = game.resolve_mode(&mode).expect("checked above");
+        let result = solve(&game, m, &req);
+        let before = m.stats().clone();
+        // LUT rebuilt with the new weights for the "after" analysis.
+        let after_lut = rebuilt_lut(&m.lut, &result.weights);
+        let after = stats::analyze(&after_lut, m.config.cost);
+        serde_json::to_value(PreviewResponse {
+            result: (*result).clone(),
+            before,
+            after,
+        })
+        .unwrap()
+    })
+    .await;
+    Json(out.unwrap_or_else(|e| json!({ "error": e.to_string() })))
+}
+
+/// The last solve, keyed by game fingerprint + mode + request: Apply is
+/// always preceded by a Preview of the same settings, and re-running the
+/// optimizer there doubled the wait for the same weights.
+type SolveKey = (String, u64, String, String);
+static LAST_SOLVE: std::sync::Mutex<Option<(SolveKey, std::sync::Arc<optimizer::OptimizeResult>)>> =
+    std::sync::Mutex::new(None);
+
+fn solve(
+    game: &crate::registry::LoadedGame,
+    m: &crate::registry::LoadedMode,
+    req: &OptimizeRequest,
+) -> std::sync::Arc<optimizer::OptimizeResult> {
+    let key = (
+        game.entry.name.clone(),
+        game.fingerprint,
+        m.config.name.clone(),
+        format!("{req:?}"),
+    );
+    if let Some((k, r)) = LAST_SOLVE.lock().unwrap().as_ref() {
+        if *k == key {
+            return r.clone();
+        }
+    }
+    let r = std::sync::Arc::new(optimizer::optimize(&m.lut, m.config.cost, req));
+    *LAST_SOLVE.lock().unwrap() = Some((key, r.clone()));
+    r
 }
 
 fn rebuilt_lut(lut: &slotlab_core::model::Lut, weights: &[u64]) -> slotlab_core::model::Lut {
@@ -87,7 +129,18 @@ async fn apply(
     let Some(m) = game.resolve_mode(&mode) else {
         return Json(json!({ "error": "unknown mode" }));
     };
-    let result = optimizer::optimize(&m.lut, m.config.cost, &req.opt);
+    let result = {
+        let (g, mode) = (game.clone(), mode.clone());
+        match tokio::task::spawn_blocking(move || {
+            let m = g.resolve_mode(&mode).expect("checked above");
+            solve(&g, m, &req.opt)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Json(json!({ "error": e.to_string() })),
+        }
+    };
     if result.weights.len() != m.lut.rows.len() {
         return Json(json!({ "error": "weight misalignment" }));
     }

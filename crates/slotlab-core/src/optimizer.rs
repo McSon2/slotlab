@@ -62,7 +62,9 @@ pub struct OptimizeResult {
     pub achieved_std: f64,
     pub most_likely_one_in: f64,
     pub feasibility: Feasibility,
-    /// New weights, aligned with the order of `lut.rows`.
+    /// New weights, aligned with the order of `lut.rows`. Not sent to the UI:
+    /// it shows the before/after stats, and a million weights is ~8 MB of JSON.
+    #[serde(skip)]
     pub weights: Vec<u64>,
 }
 
@@ -145,14 +147,27 @@ pub fn feasibility(lut: &Lut, cost: f64, cap_hr: f64) -> Feasibility {
     }
 }
 
+/// Weighted mean of `p` under the tilted weights, in one pass and without
+/// materializing them: `solve_a` evaluates it 80 times, and the volatility
+/// bisection calls `solve_a` 60 times — thousands of passes over the LUT.
+/// Same operations in the same order as `tilt_weights` + `moments`, so the
+/// result is bit-for-bit identical.
+fn tilted_mean(w0: &[f64], pn: &[f64], p: &[f64], a: f64, b: f64) -> f64 {
+    let mut w_sum = 0.0;
+    let mut wp = 0.0;
+    for ((w, &x), p) in w0.iter().zip(pn).zip(p) {
+        let arg = (a * x + b * x * x).clamp(-50.0, 50.0);
+        let wi = w * arg.exp();
+        w_sum += wi;
+        wp += wi * p;
+    }
+    wp / w_sum
+}
+
 /// Solves for `a` such that the weighted mean == target_mean (with b fixed).
 /// The mean is monotonically increasing in a → bisection.
 fn solve_a(w0: &[f64], pn: &[f64], p: &[f64], b: f64, target_mean: f64) -> f64 {
-    let mean_at = |a: f64| {
-        let w = tilt_weights(w0, pn, a, b);
-        let (_, m, _) = moments(&w, p);
-        m
-    };
+    let mean_at = |a: f64| tilted_mean(w0, pn, p, a, b);
     let (mut lo, mut hi) = (-45.0_f64, 45.0_f64);
     for _ in 0..80 {
         let mid = 0.5 * (lo + hi);

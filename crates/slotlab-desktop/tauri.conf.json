@@ -33,7 +33,8 @@
       "icons/icon.icns"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "Developer ID Application: Maxime SALTET (M95YYCW569)"
     }
   }
 }

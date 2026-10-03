@@ -338,23 +338,52 @@ pub fn run_game_checks(modes: &[(String, ModeStats, bool)]) -> GameCheckReport {
         one_in(worst_ml),
         "≥ 1 in 1000".into(),
     ));
-    let cost_int = modes.iter().all(|(_, _, i)| *i);
+    // Stake's official index.json schema declares `"cost": <float>` (its examples
+    // use 1.0 and 100.0), so fractional costs such as 1.5x are valid. The old
+    // "integer costs only" rule traced back to a third-party dev tool that parsed
+    // the field as u64 — not to the RGS. What does break is a cost the fixed-point
+    // bet arithmetic can't hold: stakes are computed in thousandths of a base bet.
+    let bad_cost = modes
+        .iter()
+        .filter(|(_, s, _)| {
+            let milli = s.cost * 1000.0;
+            s.cost <= 0.0 || (milli - milli.round()).abs() > 1e-6
+        })
+        .count();
+    let all_int = modes.iter().all(|(_, _, i)| *i);
     publish.push(mk(
-        "cost_integer",
-        "Integer costs in index.json",
-        cost_int,
-        CheckStatus::Warn,
-        if cost_int { "yes".into() } else { "float present".into() },
-        "the RGS parser rejects floats".into(),
+        "cost_format",
+        "Mode costs usable by the RGS (> 0, at most 3 decimals)",
+        bad_cost == 0,
+        CheckStatus::Fail,
+        if bad_cost > 0 {
+            format!("{bad_cost} mode(s) out of range")
+        } else if all_int {
+            "ok — all integers".into()
+        } else {
+            "ok — fractional cost present".into()
+        },
+        "1, 1.5, 2.5 … all valid".into(),
     ));
 
+    // A bet-level constraint only fails the game when no tier is reached:
+    // a 3★ game that exceeds a 2★ cap (e.g. max payout 50000x) is compliant,
+    // it just doesn't qualify for the lower tier. When no tier is reached,
+    // count the misses of the nearest tier (the fixes actually needed).
+    let tier_misses = if star_tier == 0 {
+        let miss2 = bl.iter().filter(|c| !c.pass_2star).count();
+        let miss3 = bl.iter().filter(|c| !c.pass_3star).count();
+        miss2.min(miss3)
+    } else {
+        0
+    };
     let fail_count = mode_reports
         .iter()
         .flat_map(|m| &m.checks)
         .chain(publish.iter())
         .filter(|c| c.status == CheckStatus::Fail)
         .count()
-        + bl.iter().filter(|c| !c.pass_2star).count();
+        + tier_misses;
     let warn_count = mode_reports
         .iter()
         .flat_map(|m| &m.checks)
@@ -372,5 +401,42 @@ pub fn run_game_checks(modes: &[(String, ModeStats, bool)]) -> GameCheckReport {
         bet_level_constraints: bl,
         modes: mode_reports,
         publish_checks: publish,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Lut, LutRow};
+    use crate::stats::analyze;
+
+    fn lut(rows: &[(u64, u64, u64)]) -> Lut {
+        Lut::new(
+            rows.iter()
+                .map(|&(sim_id, weight, payout_x100)| LutRow {
+                    sim_id,
+                    weight,
+                    payout_x100,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn three_star_game_is_not_failed_by_two_star_caps() {
+        // Max win 50,000x: over the 2★ cap (25,000x), within the 3★ one.
+        let l = lut(&[(0, 5_199_999, 0), (1, 4_800_000, 200), (2, 1, 5_000_000)]);
+        let s = analyze(&l, 1.0);
+        let r = run_game_checks(&[("base".into(), s, true)]);
+        assert_eq!(r.star_tier, 3);
+        assert!(r.bet_level_constraints.iter().any(|c| !c.pass_2star));
+        let check_fails = r
+            .modes
+            .iter()
+            .flat_map(|m| &m.checks)
+            .chain(r.publish_checks.iter())
+            .filter(|c| c.status == CheckStatus::Fail)
+            .count();
+        assert_eq!(r.fail_count, check_fails);
     }
 }

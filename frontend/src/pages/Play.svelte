@@ -1,9 +1,20 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, rgsUrlFor, type ImportJob } from '../lib/api';
-  import { app, refreshGames, selectedGame } from '../lib/stores.svelte';
+  import { onMount, untrack } from 'svelte';
+  import {
+    api,
+    rgsUrlFor,
+    EMPTY_FAULTS,
+    type ImportJob,
+    type Faults,
+    type FaultEndpoint,
+    type PoolOptions,
+    type PoolSummary,
+  } from '../lib/api';
+  import { app, goTo, notify, refreshGames, run, selectedGame } from '../lib/stores.svelte';
+  import { storageGetJson, storageSetJson } from '../lib/storage';
   import {
     VIEWPORT_PRESETS,
+    REVIEW_VIEWPORTS,
     CURRENCIES,
     SOCIAL_CURRENCIES,
     LANGUAGES,
@@ -13,6 +24,28 @@
   import LiveEventFeed from '../components/LiveEventFeed.svelte';
   import Bookmarks from '../components/Bookmarks.svelte';
   import BookSearch from '../components/BookSearch.svelte';
+  import ConfirmButton from '../components/ConfirmButton.svelte';
+  import Icon from '../components/Icon.svelte';
+
+  /** False while another tab is shown: App keeps Play mounted (the frames
+   * must not reload), so its own background work pauses instead. */
+  let { active = true }: { active?: boolean } = $props();
+
+  /** How long the frames survive on another tab. A quick look at Analyze
+   * must not reset a game mid-bonus, but each frame is a live WebGL game
+   * (GPU context, textures, audio, 100-300 MB): left behind for good, they
+   * weigh on every other tab. Past this delay they are released, and come
+   * back reloaded. */
+  const HIDDEN_FRAMES_TTL_MS = 3 * 60_000;
+  let framesAlive = $state(true);
+  $effect(() => {
+    if (active) {
+      framesAlive = true;
+      return;
+    }
+    const t = setTimeout(() => (framesAlive = false), HIDDEN_FRAMES_TTL_MS);
+    return () => clearTimeout(t);
+  });
 
   const PREFS_KEY = 'slotlab-play-prefs';
 
@@ -26,52 +59,83 @@
     customViewports: ViewportPreset[];
   }
 
-  function loadPrefs(): Partial<PlayPrefs> {
-    try {
-      return JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}');
-    } catch {
-      return {};
-    }
-  }
-
-  const saved = loadPrefs();
+  const saved = storageGetJson<Partial<PlayPrefs>>(PREFS_KEY, {});
 
   let tlsTrusted = $state(true);
   let installBusy = $state(false);
 
   let activeViewports = $state<string[]>(saved.activeViewports ?? ['desktop', 'mobile-m']);
-  let currency = $state(saved.currency ?? 'USD');
-  let social = $state(saved.social ?? false);
+  const savedSocial = saved.social ?? false;
+  const savedCurrency = saved.currency ?? 'USD';
+  let social = $state(savedSocial);
   // Prefs inherited from a version without social filtering: realign currency ↔ social.
-  if (social !== SOCIAL_CURRENCIES.includes(currency)) {
-    currency = social ? SOCIAL_CURRENCIES[0] : 'USD';
-  }
+  let currency = $state(
+    savedSocial === SOCIAL_CURRENCIES.includes(savedCurrency)
+      ? savedCurrency
+      : savedSocial ? SOCIAL_CURRENCIES[0] : 'USD',
+  );
   let lang = $state(saved.lang ?? 'en');
   let balance = $state(saved.balance ?? 10000);
   let scalePct = $state(saved.scalePct ?? 60);
   let customViewports = $state<ViewportPreset[]>(saved.customViewports ?? []);
-  let customW = $state('');
-  let customH = $state('');
+  let customW = $state<number | null>(null);
+  let customH = $state<number | null>(null);
 
   let forceMode = $state('');
   let forceSim = $state('');
-  let forceActive = $state(false);
+  /** What the server is forcing right now (the inputs may have moved on). */
+  let forced = $state<{ mode: string; simId: number } | null>(null);
+  let forceBusy = $state(false);
+  const forceSimValid = $derived(/^\d+$/.test(forceSim.trim()));
+
+  // Bonus-only draw, per spin mode (base, hunt…): every spin of that mode
+  // opens a bonus, a different one each time (LUT-weighted among the bonus
+  // books) — a pinned book always wins over it.
+  let poolModes = $state<PoolOptions[]>([]);
+  /** What the server restricts right now, by mode. */
+  let poolActive = $state<Record<string, PoolSummary>>({});
+  /** By mode: 'off' | 'any' | 'tier:N' */
+  let poolChoice = $state<Record<string, string>>({});
+  /** Mode whose change is in flight. */
+  let poolBusy = $state<string | null>(null);
+  let poolLoadedFor = $state<string | null>(null);
 
   let epoch = $state(1);
   let reloadKey = $state(0);
   /** Game the frames are running for (auto-launch on change). */
   let launchedFor = $state<string | null>(null);
+  /** Launches in flight (several controls relaunch on change). */
+  let launches = $state(0);
+
+  // ── QA scenarios ─────────────────────────────────────────────────────────
+  // The states the review reaches by accident: a round left open by a closed
+  // tab, a balance too small for the next spin, an RGS that errors or crawls,
+  // a broken rgs_url. None of them can be produced by playing normally, and
+  // four refusals came from the game's answer to them.
+  let faults = $state<Faults>({ ...EMPTY_FAULTS });
+  let faultEndpoint = $state<FaultEndpoint>('play');
+  let faultKind = $state<'rgsError' | 'http500' | 'hang'>('rgsError');
+  let faultCode = $state('ERR_GE');
+  let faultOnce = $state(true);
+  /** Launches the frames with an rgs_url that resolves nowhere. */
+  let brokenRgs = $state(false);
+  let faultsBusy = $state(false);
+  let balanceBusy = $state(false);
+  /** Guidance after "Balance → $x": persistent until the next launch. */
+  let balanceNote = $state<string | null>(null);
 
   let importInfo = $state<{ imported: boolean; job: ImportJob | null } | null>(null);
+  let retryBusy = $state(false);
   /** Custom URL (Vite dev). Empty = build served by SlotLab (auto). */
   let customUrl = $state('');
-  let statusMsg = $state<string | null>(null);
 
   const game = $derived(selectedGame());
   const baseUrl = $derived(
     customUrl.trim() ? customUrl.trim().replace(/\/$/, '') : (game?.servedUrl ?? ''),
   );
   const canPlay = $derived(Boolean(game?.loaded && baseUrl));
+  /** The games list can lag behind the import poll: either one is enough. */
+  const isImported = $derived(Boolean(game?.imported || importInfo?.imported));
 
   const allViewports = $derived([...VIEWPORT_PRESETS, ...customViewports]);
 
@@ -79,14 +143,14 @@
     const prefs: PlayPrefs = {
       activeViewports, currency, social, lang, balance, scalePct, customViewports,
     };
-    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+    storageSetJson(PREFS_KEY, prefs);
   });
 
   onMount(() => {
     api.tlsStatus().then((s) => (tlsTrusted = s.trusted)).catch(() => {});
+    return stopImportPoll;
   });
 
-  // Auto-launch: as soon as the selected game is imported and playable.
   let seenGame = $state<string | null>(null);
   $effect(() => {
     if (!game) return;
@@ -94,39 +158,158 @@
       // Game change: restore its persisted custom URL.
       seenGame = game.name;
       customUrl = game.frontUrl ?? '';
-      void pollImport();
-    }
-    if (game.imported && canPlay && launchedFor !== game.name) {
-      launchedFor = game.name;
-      void launch();
+      importInfo = null;
+      balanceNote = null;
+      // A force belongs to the previous game; the form starts on its first mode.
+      forced = null;
+      forceSim = '';
+      forceMode = game.modes[0]?.name ?? '';
+      poolModes = [];
+      poolActive = {};
+      poolChoice = {};
+      poolLoadedFor = null;
+      // Faults live on the server: a panel that forgot them would lie about
+      // what the next spin is going to do.
+      const name = game.name;
+      api.getFaults(name)
+        .then((r) => { if (name === app.selectedGame) faults = r.faults; })
+        .catch(() => (faults = { ...EMPTY_FAULTS }));
+      untrack(() => void pollImport());
     }
   });
 
-  async function pollImport() {
-    if (!app.selectedGame) return;
+  // The modes list can change on reload: never leave the select on a mode
+  // that no longer exists (an empty select forces nothing).
+  $effect(() => {
+    if (game && !game.modes.some((m) => m.name === forceMode)) {
+      forceMode = game.modes[0]?.name ?? '';
+    }
+  });
+
+  // The pool needs the books index: loaded once the import is done.
+  $effect(() => {
+    if (game && isImported && poolLoadedFor !== game.name) {
+      poolLoadedFor = game.name;
+      untrack(() => void loadPool());
+    }
+  });
+
+  function poolKey(p: PoolSummary | undefined): string {
+    if (!p) return 'off';
+    return p.tier == null ? 'any' : `tier:${p.tier}`;
+  }
+
+  function fmtOneIn(n: number): string {
+    return n >= 100 ? Math.round(n).toLocaleString('en-US') : n.toFixed(1);
+  }
+
+  async function loadPool() {
+    const name = app.selectedGame;
+    if (!name) return;
     try {
-      importInfo = await api.importStatus(app.selectedGame);
-      if (importInfo.job?.state === 'running' || !importInfo.imported) {
-        setTimeout(pollImport, 900);
-      } else if (importInfo.imported && game && launchedFor !== game.name && canPlay) {
-        launchedFor = game.name;
-        void launch();
+      const r = await api.getPool(name);
+      if (name !== app.selectedGame) return;
+      poolModes = r.modes;
+      poolActive = Object.fromEntries(r.active.map((p) => [p.mode, p]));
+      poolChoice = Object.fromEntries(r.modes.map((o) => [o.mode, poolKey(poolActive[o.mode])]));
+    } catch {
+      poolModes = [];
+    }
+  }
+
+  async function applyPool(mode: string) {
+    if (!game) return;
+    const name = game.name;
+    const choice = poolChoice[mode] ?? 'off';
+    const enabled = choice !== 'off';
+    const tier = choice.startsWith('tier:') ? Number(choice.slice(5)) : null;
+    poolBusy = mode;
+    const r = await run(() => api.setPool({ game: name, enabled, mode, tier }), {
+      ok: enabled
+        ? `${mode}: bonus books only — every spin opens a bonus`
+        : `${mode}: full LUT again`,
+      error: 'Could not change the draw',
+    });
+    poolBusy = null;
+    if (r) {
+      const next = { ...poolActive };
+      if (r.active) next[mode] = r.active;
+      else delete next[mode];
+      poolActive = next;
+    }
+    poolChoice = { ...poolChoice, [mode]: poolKey(poolActive[mode]) };
+  }
+
+  // Auto-launch: as soon as the selected game is imported and playable — and
+  // only while Play is on screen, so a game picked from another tab doesn't
+  // spin up hidden sessions.
+  $effect(() => {
+    if (!active || !game) return;
+    if (isImported && canPlay && launchedFor !== game.name) {
+      launchedFor = game.name;
+      untrack(() => void launch());
+    }
+  });
+
+  // ── Import polling ───────────────────────────────────────────────────────
+  // One timer at most; paused while Play is hidden, resumed when it's back.
+  let importTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Import not finished: a poll is owed (possibly deferred while hidden). */
+  let importDue = false;
+
+  function stopImportPoll() {
+    if (importTimer) clearTimeout(importTimer);
+    importTimer = null;
+  }
+
+  function scheduleImportPoll(ms: number) {
+    stopImportPoll();
+    importDue = true;
+    if (active) importTimer = setTimeout(pollImport, ms);
+  }
+
+  $effect(() => {
+    const on = active;
+    untrack(() => {
+      if (!on) stopImportPoll();
+      else if (importDue && !importTimer) void pollImport();
+    });
+  });
+
+  async function pollImport() {
+    stopImportPoll();
+    const name = app.selectedGame;
+    if (!name) return;
+    try {
+      const info = await api.importStatus(name);
+      if (name !== app.selectedGame) return; // game changed meanwhile
+      importInfo = info;
+      if (info.job?.state === 'running' || !info.imported) {
+        // A failed import only changes on Retry: no need to hammer it.
+        scheduleImportPoll(info.job?.state === 'failed' ? 5000 : 900);
+      } else {
+        importDue = false;
       }
     } catch {
       importInfo = null;
+      importDue = false;
     }
+  }
+
+  async function retryImport() {
+    if (!game) return;
+    const name = game.name;
+    retryBusy = true;
+    await run(() => api.startImport(name), { error: 'Could not restart the import' });
+    retryBusy = false;
+    await pollImport();
   }
 
   async function installCa() {
     installBusy = true;
-    try {
-      const r = await api.tlsInstall();
-      tlsTrusted = r.trusted;
-    } catch (e) {
-      statusMsg = e instanceof Error ? e.message : String(e);
-    } finally {
-      installBusy = false;
-    }
+    const r = await run(() => api.tlsInstall(), { error: 'CA install failed' });
+    if (r) tlsTrusted = r.trusted;
+    installBusy = false;
   }
 
   function sessionId(viewportId: string): string {
@@ -137,7 +320,9 @@
     if (!game) return '';
     const params = new URLSearchParams({
       sessionID: sessionId(viewportId),
-      rgs_url: rgsUrlFor(game.name),
+      // An unreachable RGS must give a blocking error screen, not a game
+      // that renders its children over a dead session (Stake review rule §24.7).
+      rgs_url: brokenRgs ? 'localhost:9/api/rgs/nowhere' : rgsUrlFor(game.name),
       lang,
       currency,
       device,
@@ -158,48 +343,169 @@
 
   async function launch() {
     if (!game || !canPlay) return;
-    statusMsg = null;
-    if (customUrl.trim() !== (game.frontUrl ?? '')) {
-      await api.updateFrontUrl(game.name, customUrl.trim());
-      await refreshGames();
-    }
-    await Promise.all(
-      activeViewports.map((v) =>
-        api.prepareSession({
-          sessionId: sessionId(v),
-          game: game.name,
-          balance: Math.round(balance * 1_000_000),
-          currency,
-          social,
-          language: lang,
-        }),
-      ),
+    const g = game;
+    balanceNote = null;
+    launches += 1;
+    const ok = await run(
+      async () => {
+        if (customUrl.trim() !== (g.frontUrl ?? '')) {
+          await api.updateFrontUrl(g.name, customUrl.trim());
+          await refreshGames();
+        }
+        await Promise.all(
+          activeViewports.map((v) =>
+            api.prepareSession({
+              sessionId: sessionId(v),
+              game: g.name,
+              balance: Math.round(balance * 1_000_000),
+              currency,
+              social,
+              language: lang,
+            }),
+          ),
+        );
+        return true;
+      },
+      { error: 'Could not launch the game' },
     );
-    reloadKey += 1;
+    launches -= 1;
+    if (ok) reloadKey += 1;
   }
 
   async function resetSessions() {
     if (!game) return;
-    await api.resetSessions(game.name);
+    const name = game.name;
+    const ok = await run(() => api.resetSessions(name), {
+      ok: 'Sessions reset — fresh balance and no open round',
+      error: 'Could not reset the sessions',
+    });
+    if (!ok) return;
     epoch += 1;
     await launch();
   }
 
-  async function applyForce() {
-    if (!game || !forceSim.trim()) return;
-    await api.setForce({
-      game: game.name,
-      mode: forceMode || game.modes[0]?.name,
-      simId: Number(forceSim),
+  /** Forces a book on the next spin of every viewport. */
+  async function force(mode: string, simId: number): Promise<boolean> {
+    if (!game) return false;
+    const name = game.name;
+    forceBusy = true;
+    const ok = await run(() => api.setForce({ game: name, mode, simId }), {
+      ok: `Forced ${mode} #${simId} — next spin`,
+      error: 'Could not force the book',
     });
-    forceActive = true;
+    forceBusy = false;
+    if (ok) forced = { mode, simId };
+    return Boolean(ok);
+  }
+
+  async function applyForce() {
+    if (!game || !forceSimValid) return;
+    const mode = forceMode || game.modes[0]?.name;
+    if (!mode) return;
+    await force(mode, Number(forceSim.trim()));
   }
 
   async function clearForce() {
     if (!game) return;
-    await api.setForce({ game: game.name });
-    forceActive = false;
+    const name = game.name;
+    forceBusy = true;
+    const ok = await run(() => api.setForce({ game: name }), {
+      ok: 'Force cleared — spins draw random books again',
+      error: 'Could not clear the force',
+    });
+    forceBusy = false;
+    if (ok) forced = null;
   }
+
+  /** From the search, the live feed or a bookmark: fills the form and forces. */
+  function forceFrom(mode: string, simId: number) {
+    forceMode = mode;
+    forceSim = String(simId);
+    void force(mode, simId);
+  }
+
+  async function pushFaults(ok?: string) {
+    if (!game) return;
+    const name = game.name;
+    faultsBusy = true;
+    const r = await run(() => api.setFaults(name, faults), {
+      ok,
+      error: 'Could not update the QA scenarios',
+    });
+    faultsBusy = false;
+    if (r) {
+      faults = r.faults;
+    } else {
+      // The panel was edited optimistically: resync it with what the server runs.
+      api.getFaults(name).then((s) => (faults = s.faults)).catch(() => {});
+    }
+  }
+
+  async function armFailure() {
+    const code = faultCode.trim() || 'ERR_GE';
+    faults = {
+      ...faults,
+      failures: [
+        ...faults.failures.filter((f) => f.endpoint !== faultEndpoint),
+        {
+          endpoint: faultEndpoint,
+          kind: faultKind,
+          code,
+          remaining: faultOnce ? 1 : 0,
+          limited: faultOnce,
+        },
+      ],
+    };
+    const what = faultKind === 'rgsError' ? `RGS error ${code}` : faultKind === 'http500' ? 'HTTP 500' : 'no answer';
+    await pushFaults(`Armed: ${faultEndpoint} → ${what}${faultOnce ? ' (once)' : ''}`);
+  }
+
+  async function dropFailure(endpoint: FaultEndpoint) {
+    faults = {
+      ...faults,
+      failures: faults.failures.filter((f) => f.endpoint !== endpoint),
+    };
+    await pushFaults();
+  }
+
+  async function clearFaults() {
+    const wasBroken = brokenRgs;
+    faults = { ...EMPTY_FAULTS };
+    brokenRgs = false;
+    await pushFaults('QA scenarios cleared');
+    // The frames were launched on the dead rgs_url: point them back.
+    if (wasBroken) await launch();
+  }
+
+  /** Walks every open viewport down to a balance, in dollars. */
+  async function setBalanceTo(dollars: number) {
+    if (!game) return;
+    const name = game.name;
+    balanceBusy = true;
+    const ok = await run(
+      () =>
+        Promise.all(
+          activeViewports.map((v) =>
+            api.setBalance({
+              sessionId: sessionId(v),
+              game: name,
+              balance: Math.round(dollars * 1_000_000),
+            }),
+          ),
+        ),
+      { error: 'Could not set the balance' },
+    );
+    balanceBusy = false;
+    if (ok) {
+      balanceNote =
+        `Balance set to $${dollars.toFixed(2)} — spin now: the game must say why it can't, ` +
+        `on all three paths (click, autoplay, space hold).`;
+    }
+  }
+
+  const faultsOn = $derived(
+    faults.latencyMs > 0 || faults.keepRoundOpen || faults.failures.length > 0 || brokenRgs,
+  );
 
   function toggleViewport(id: string) {
     activeViewports = activeViewports.includes(id)
@@ -208,32 +514,32 @@
     void launch();
   }
 
+  const customValid = $derived(
+    Number(customW) >= 100 && Number(customH) >= 100,
+  );
+
   function addCustomViewport() {
-    const w = Number(customW);
-    const h = Number(customH);
+    const w = Math.round(Number(customW));
+    const h = Math.round(Number(customH));
     if (!w || !h || w < 100 || h < 100) return;
     const id = `custom-${w}x${h}`;
-    if (allViewports.some((v) => v.id === id)) return;
+    if (allViewports.some((v) => v.id === id)) {
+      notify(`${w}×${h} is already in the list`, 'info');
+      return;
+    }
     customViewports = [
       ...customViewports,
       { id, label: `${w}×${h}`, width: w, height: h, device: w >= h ? 'desktop' : 'mobile' },
     ];
     activeViewports = [...activeViewports, id];
-    customW = '';
-    customH = '';
+    customW = null;
+    customH = null;
     void launch();
   }
 
   function removeCustomViewport(id: string) {
     customViewports = customViewports.filter((v) => v.id !== id);
     activeViewports = activeViewports.filter((v) => v !== id);
-  }
-
-  function forceFrom(mode: string, simId: number) {
-    forceMode = mode;
-    forceSim = String(simId);
-    forceActive = true;
-    void api.setForce({ game: game!.name, mode, simId });
   }
 
   const importPct = $derived(
@@ -244,7 +550,7 @@
 </script>
 
 {#if !tlsTrusted}
-  <div class="banner">
+  <div class="banner warn">
     <span>
       The local CA is not installed — games can't reach the RGS over HTTPS.
       Once is enough (macOS password prompted).
@@ -256,19 +562,24 @@
 {/if}
 
 {#if !game}
-  <div class="panel">
+  <div class="panel empty">
     <p class="dim">
-      No game. <strong>Games</strong> tab → add a
-      <code>publish_files</code> folder — everything else is automatic.
+      No game yet. Add a <code>publish_files</code> folder in
+      <strong>Games</strong> — everything else is automatic.
     </p>
+    <button class="primary" onclick={() => goTo('games')}>Add a game</button>
   </div>
 {:else}
   {#if importInfo && !importInfo.imported}
-    <div class="banner">
-      {#if importInfo.job?.state === 'failed'}
+    {#if importInfo.job?.state === 'failed'}
+      <div class="banner error">
         <span>Import failed: {importInfo.job.error}</span>
-        <button onclick={() => api.startImport(game.name).then(pollImport)}>Retry</button>
-      {:else}
+        <button onclick={retryImport} disabled={retryBusy}>
+          {retryBusy ? 'Retrying…' : 'Retry'}
+        </button>
+      </div>
+    {:else}
+      <div class="banner info">
         <span>
           Preparing books for <strong>{game.name}</strong>
           {#if importInfo.job?.currentMode}
@@ -276,14 +587,19 @@
           {/if}
           <span class="dim">· the game will launch on its own</span>
         </span>
-        <progress max="100" value={importPct} style="flex:1"></progress>
+        <progress
+          max="100"
+          value={importPct}
+          style="flex:1"
+          aria-label="Import progress"
+        ></progress>
         <span class="num">{importPct}%</span>
-      {/if}
-    </div>
+      </div>
+    {/if}
   {/if}
 
   {#if !game.servedUrl && !customUrl}
-    <div class="banner">
+    <div class="banner warn">
       <span>
         No frontend build detected for <strong>{game.name}</strong> —
         build it (<code>pnpm --filter {game.name} build</code>) then
@@ -292,99 +608,375 @@
     </div>
   {/if}
 
-  <section class="controls-strip">
-    <label>
-      <span>Currency</span>
-      <select bind:value={currency} onchange={launch}>
-        {#each currencyOptions as c (c)}<option>{c}</option>{/each}
-      </select>
-    </label>
-    <label>
-      <span>Language</span>
-      <select bind:value={lang} onchange={launch}>
-        {#each LANGUAGES as l (l)}<option>{l}</option>{/each}
-      </select>
-    </label>
-    <label>
-      <span>Balance $</span>
-      <input type="number" bind:value={balance} min="0" step="100" style="width: 90px" onchange={launch} />
-    </label>
-    <label class="check">
-      <input type="checkbox" bind:checked={social} onchange={onSocialChange} />
-      <span>Social</span>
-    </label>
-    <span class="sep"></span>
-    <label>
-      <span>Force · mode</span>
-      <select bind:value={forceMode}>
-        {#each game.modes as m (m.name)}<option value={m.name}>{m.name}</option>{/each}
-      </select>
-    </label>
-    <label>
-      <span>Event ID</span>
-      <input bind:value={forceSim} placeholder="50931" style="width: 90px" />
-    </label>
-    <button onclick={applyForce}>Force</button>
-    {#if forceActive}
-      <button class="ghost" onclick={clearForce}>✕ {forceMode} #{forceSim}</button>
-    {/if}
-    <span class="sep"></span>
-    <button onclick={launch}>Reload</button>
-    <button class="ghost" onclick={resetSessions}>Reset sessions</button>
+  <!-- Two groups that wrap as units: the session setup, then the force form.
+       Separators sit on each group's left edge; the first group of every
+       row has its separator clipped away (see .strip-clip). -->
+  <section class="strip controls-strip" aria-label="Session and force controls">
+    <div class="strip-clip">
+      <div class="strip-row">
+        <div class="group" role="group" aria-label="Session">
+          <label>
+            <span>Currency</span>
+            <select bind:value={currency} onchange={launch}>
+              {#each currencyOptions as c (c)}<option>{c}</option>{/each}
+            </select>
+          </label>
+          <label>
+            <span>Language</span>
+            <select bind:value={lang} onchange={launch}>
+              {#each LANGUAGES as l (l)}<option>{l}</option>{/each}
+            </select>
+          </label>
+          <label>
+            <span>Balance $</span>
+            <input
+              type="number"
+              bind:value={balance}
+              min="0"
+              step="100"
+              style="width: 90px"
+              onchange={launch}
+            />
+          </label>
+          <label class="check">
+            <input type="checkbox" bind:checked={social} onchange={onSocialChange} />
+            <span>Social</span>
+          </label>
+          <span class="group-actions">
+            <button onclick={launch} disabled={launches > 0} title="Prepare the sessions and reload every viewport">
+              {launches > 0 ? 'Reloading…' : 'Reload'}
+            </button>
+            <ConfirmButton
+              onconfirm={resetSessions}
+              confirmLabel="Reset all sessions?"
+              title="New sessions: fresh balance, no open round"
+            >Reset sessions</ConfirmButton>
+          </span>
+        </div>
+
+        <form
+          class="group"
+          aria-label="Force a book"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void applyForce();
+          }}
+        >
+          <label>
+            <span>Force · mode</span>
+            <select bind:value={forceMode}>
+              {#each game.modes as m (m.name)}<option value={m.name}>{m.name}</option>{/each}
+            </select>
+          </label>
+          <label>
+            <span>Event ID</span>
+            <input
+              bind:value={forceSim}
+              placeholder="e.g. 50931"
+              inputmode="numeric"
+              autocomplete="off"
+              style="width: 96px"
+            />
+          </label>
+          <button type="submit" disabled={!forceSimValid || forceBusy}>
+            {forceBusy ? 'Forcing…' : 'Force'}
+          </button>
+          {#if forced}
+            <button
+              type="button"
+              class="ghost forced-chip"
+              onclick={clearForce}
+              disabled={forceBusy}
+              title="Stop forcing — spins draw random books again"
+              aria-label="Clear the forced book {forced.mode} #{forced.simId}"
+            >
+              <Icon name="close" size={12} />
+              {forced.mode} #{forced.simId}
+            </button>
+          {/if}
+        </form>
+
+        {#if poolModes.length > 0}
+          <div class="group" role="group" aria-label="Bonus-only draw">
+            {#each poolModes as o (o.mode)}
+              <label title="Each {o.mode} spin draws a random bonus book, weighted like the real game. A forced book wins over it.">
+                <span>{o.mode} · draw</span>
+                <select
+                  value={poolChoice[o.mode] ?? 'off'}
+                  onchange={(e) => {
+                    poolChoice = { ...poolChoice, [o.mode]: e.currentTarget.value };
+                    void applyPool(o.mode);
+                  }}
+                  disabled={poolBusy === o.mode}
+                >
+                  <option value="off">All books</option>
+                  <option value="any">
+                    Bonus only · {o.any.books.toLocaleString('en-US')} books · 1 in {fmtOneIn(o.any.oneIn)}
+                  </option>
+                  {#if o.tiers.length > 1}
+                    {#each o.tiers as t (t.tier)}
+                      <option value="tier:{t.tier}">
+                        Bonus {t.tier} scatters · {t.books.toLocaleString('en-US')} books · 1 in {fmtOneIn(t.oneIn)}
+                      </option>
+                    {/each}
+                  {/if}
+                </select>
+              </label>
+            {/each}
+            {#if forced && poolActive[forced.mode]}
+              <span class="pool-note" role="status">{forced.mode} #{forced.simId} forced first — clear it to draw bonuses</span>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
   </section>
 
-  <section class="controls-strip viewports">
-    <span class="strip-label">Viewports</span>
-    {#each allViewports as v (v.id)}
-      <label class="check">
+  <section class="strip viewports" aria-label="Viewports">
+    <div class="vp-list" role="group" aria-labelledby="vp-label">
+      <span class="strip-label" id="vp-label">Viewports</span>
+      {#each allViewports as v (v.id)}
+        <span class="vp-item">
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={activeViewports.includes(v.id)}
+              onchange={() => toggleViewport(v.id)}
+            />
+            <span>{v.label}</span>
+          </label>
+          {#if v.id.startsWith('custom-')}
+            <button
+              type="button"
+              class="ghost vp-remove"
+              aria-label="Remove viewport {v.label}"
+              title="Remove viewport {v.label}"
+              onclick={() => removeCustomViewport(v.id)}
+            ><Icon name="close" size={11} /></button>
+          {/if}
+        </span>
+      {/each}
+    </div>
+
+    <div class="vp-tools">
+      <button
+        class="ghost"
+        title="The {REVIEW_VIEWPORTS.length} viewports the review always opens"
+        onclick={() => {
+          activeViewports = [...REVIEW_VIEWPORTS];
+          void launch();
+        }}
+      >Review pack</button>
+      <form
+        class="custom-add"
+        aria-label="Add a custom viewport"
+        onsubmit={(e) => {
+          e.preventDefault();
+          addCustomViewport();
+        }}
+      >
         <input
-          type="checkbox"
-          checked={activeViewports.includes(v.id)}
-          onchange={() => toggleViewport(v.id)}
+          type="number"
+          min="100"
+          step="1"
+          style="width: 72px"
+          bind:value={customW}
+          placeholder="W"
+          aria-label="Custom width"
         />
-        <span>{v.label}</span>
-        {#if v.id.startsWith('custom-')}
-          <button class="ghost tiny" onclick={() => removeCustomViewport(v.id)}>✕</button>
-        {/if}
+        <span aria-hidden="true">×</span>
+        <input
+          type="number"
+          min="100"
+          step="1"
+          style="width: 72px"
+          bind:value={customH}
+          placeholder="H"
+          aria-label="Custom height"
+        />
+        <button type="submit" class="ghost" disabled={!customValid}>+ custom</button>
+      </form>
+      <label class="zoom">
+        <span>Zoom {scalePct}%</span>
+        <input type="range" min="25" max="100" step="5" bind:value={scalePct} />
       </label>
-    {/each}
-    <span class="custom-add">
-      <input style="width: 56px" bind:value={customW} placeholder="800" />
-      ×
-      <input style="width: 56px" bind:value={customH} placeholder="450" />
-      <button class="ghost" onclick={addCustomViewport}>+ custom</button>
-    </span>
-    <label class="zoom">
-      <span>Zoom {scalePct}%</span>
-      <input type="range" min="25" max="100" step="5" bind:value={scalePct} />
-    </label>
+    </div>
   </section>
 
   <details class="advanced">
     <summary>Custom frontend URL (Vite dev, hot-reload)</summary>
-    <div class="advanced-row">
+    <form
+      class="advanced-row"
+      onsubmit={(e) => {
+        e.preventDefault();
+        void launch();
+      }}
+    >
       <input
         bind:value={customUrl}
+        aria-label="Custom frontend URL"
         placeholder="http://localhost:5174 — empty = build served by SlotLab ({game.servedUrl ?? 'none'})"
       />
-      <button onclick={launch}>Apply</button>
+      <button type="submit" disabled={launches > 0}>Apply</button>
       {#if customUrl}
-        <button class="ghost" onclick={() => { customUrl = ''; void launch(); }}>
+        <button type="button" class="ghost" onclick={() => { customUrl = ''; void launch(); }}>
           Back to auto build
         </button>
       {/if}
+    </form>
+  </details>
+
+  <details class="advanced" class:armed={faultsOn}>
+    <summary>
+      QA scenarios — fault injection
+      {#if faultsOn}<span class="pill yellow">armed</span>{/if}
+    </summary>
+    <div class="qa-grid">
+      <div class="qa-block">
+        <p class="overline">Interrupted round</p>
+        <label class="check">
+          <input
+            type="checkbox"
+            bind:checked={faults.keepRoundOpen}
+            disabled={faultsBusy}
+            onchange={() => { faults.keepRoundOpenOnce = faults.keepRoundOpen; void pushFaults(); }}
+          />
+          <span>Leave the next round open (unpaid)</span>
+        </label>
+        <p class="note">
+          Spin once, then <strong>Reload</strong>: authenticate hands the round
+          back and the game must offer to watch or skip it — with the bet of
+          THAT round restored, not the one currently selected.
+        </p>
+      </div>
+
+      <div class="qa-block">
+        <p class="overline">Not enough to spin</p>
+        <div class="qa-row">
+          <button onclick={() => setBalanceTo(0.5)} disabled={balanceBusy}>Balance → $0.50</button>
+          <button
+            onclick={() => setBalanceTo(0)}
+            disabled={balanceBusy}
+            aria-label="Balance → $0"
+          >→ $0</button>
+        </div>
+        <p class="note">
+          The buttons must stay clickable and answer with a modal. The three
+          spin paths are click, autoplay and holding space.
+        </p>
+      </div>
+
+      <div class="qa-block">
+        <p class="overline">RGS misbehaviour</p>
+        <form
+          class="qa-row"
+          aria-label="Arm an RGS failure"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void armFailure();
+          }}
+        >
+          <select bind:value={faultEndpoint} aria-label="Endpoint to fail">
+            <option value="play">play</option>
+            <option value="authenticate">authenticate</option>
+            <option value="balance">balance</option>
+            <option value="endRound">end-round</option>
+            <option value="event">bet/event</option>
+            <option value="replay">replay</option>
+          </select>
+          <select bind:value={faultKind} aria-label="Failure kind">
+            <option value="rgsError">RGS error</option>
+            <option value="http500">HTTP 500</option>
+            <option value="hang">never answers</option>
+          </select>
+          {#if faultKind === 'rgsError'}
+            <input
+              bind:value={faultCode}
+              style="width: 92px"
+              placeholder="ERR_GE"
+              aria-label="RGS error code"
+            />
+          {/if}
+          <label class="check">
+            <input type="checkbox" bind:checked={faultOnce} />
+            <span>once</span>
+          </label>
+          <button type="submit" disabled={faultsBusy}>Arm</button>
+        </form>
+        {#if faults.failures.length > 0}
+          <div class="qa-row">
+            {#each faults.failures as f (f.endpoint)}
+              <button
+                class="ghost"
+                disabled={faultsBusy}
+                title="Disarm this failure"
+                onclick={() => dropFailure(f.endpoint)}
+              >
+                <Icon name="close" size={12} />
+                {f.endpoint} · {f.kind}{f.kind === 'rgsError' ? ' ' + f.code : ''}{f.limited ? ` ×${f.remaining}` : ''}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
+      <div class="qa-block">
+        <p class="overline">Slow link</p>
+        <div class="qa-row" role="group" aria-label="RGS latency">
+          {#each [0, 250, 800, 2000] as ms (ms)}
+            <button
+              class:primary={faults.latencyMs === ms}
+              aria-pressed={faults.latencyMs === ms}
+              disabled={faultsBusy}
+              onclick={() => { faults.latencyMs = ms; void pushFaults(); }}
+            >{ms === 0 ? 'none' : ms + ' ms'}</button>
+          {/each}
+        </div>
+        <p class="note">
+          Every RGS answer is delayed. A double click during the wait must not
+          buy two spins.
+        </p>
+      </div>
+
+      <div class="qa-block">
+        <p class="overline">Broken rgs_url</p>
+        <div class="qa-row">
+          <label class="check">
+            <input type="checkbox" bind:checked={brokenRgs} onchange={launch} />
+            <span>Launch pointing nowhere</span>
+          </label>
+          <ConfirmButton
+            onconfirm={clearFaults}
+            confirmLabel="Clear all scenarios?"
+            disabled={faultsBusy || !faultsOn}
+            title="Disarm every QA scenario above"
+          >Clear everything</ConfirmButton>
+        </div>
+        <p class="note">
+          A game whose RGS never answers must show a blocking error screen and
+          render nothing else (Stake review rule §24.7).
+        </p>
+      </div>
     </div>
   </details>
 
-  {#if statusMsg}
-    <div class="banner error">{statusMsg}</div>
+  {#if balanceNote}
+    <div class="banner info">
+      <span>{balanceNote}</span>
+      <button
+        class="ghost dismiss"
+        aria-label="Dismiss"
+        onclick={() => (balanceNote = null)}
+      ><Icon name="close" size={13} /></button>
+    </div>
   {/if}
 
-  {#if canPlay && game.imported}
+  {#if canPlay && isImported && framesAlive}
     <div class="frames">
       {#each allViewports.filter((v) => activeViewports.includes(v.id)) as v (v.id + '-' + reloadKey)}
         <GameFrame
           url={frameUrl(v.id, v.device)}
+          game={game.name}
           width={v.width}
           height={v.height}
           label={v.label}
@@ -403,31 +995,70 @@
 {/if}
 
 <style>
-  .controls-strip {
-    --ctrl-h: 32px;
+  .empty {
     display: flex;
     flex-wrap: wrap;
-    align-items: flex-end;
-    gap: 10px 14px;
-    padding: 10px 0 12px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 12px;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3) var(--sp-5);
   }
 
-  /* One control height for everything → bottoms line up with align-items: flex-end. */
-  .controls-strip :is(select, button:not(.tiny), input:not([type='checkbox']):not([type='range'])) {
+  .empty p {
+    margin: 0;
+  }
+
+  .banner .dismiss {
+    margin-left: auto;
+    padding: var(--sp-1);
+    line-height: 0;
+  }
+
+  .advanced.armed > summary {
+    color: var(--warn);
+  }
+
+  .qa-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: var(--sp-4) var(--sp-6);
+    padding: var(--sp-3) 2px var(--sp-1);
+  }
+
+  .qa-block .note {
+    margin: 6px 0 0;
+    max-width: 46ch;
+    font-size: var(--fs-xs);
+    color: var(--text-faint);
+  }
+
+  .qa-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+  }
+
+  /* ── Control strips: one control height, bottoms flush ─────────────── */
+
+  .strip {
+    --ctrl-h: 32px;
+  }
+
+  .strip :is(select, input:not([type='checkbox']):not([type='range'])),
+  .strip :global(button:not(.vp-remove)) {
     height: var(--ctrl-h);
     box-sizing: border-box;
   }
 
-  .controls-strip label {
+  .strip label {
     display: flex;
     flex-direction: column;
     gap: 5px;
   }
 
-  .controls-strip label > span:first-child {
-    font-size: 10px;
+  .strip label > span:first-child {
+    font-size: var(--fs-2xs);
     line-height: 1;
     text-transform: uppercase;
     letter-spacing: 0.1em;
@@ -435,36 +1066,113 @@
     white-space: nowrap;
   }
 
-  .controls-strip label.check {
+  .strip label.check {
     flex-direction: row;
     align-items: center;
     gap: 6px;
     height: var(--ctrl-h);
-    font-size: 12.5px;
+    font-size: var(--fs-sm);
     color: var(--text-dim);
   }
 
-  .sep {
-    width: 1px;
-    align-self: stretch;
-    background: var(--border);
-    margin: 0 4px;
+  .controls-strip {
+    padding-block: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: var(--sp-3);
+  }
+
+  /* Clips the separator of whichever group starts a row; the 4 px of
+     padding keep focus outlines of edge controls visible. */
+  .strip-clip {
+    overflow: hidden;
+    margin: -4px;
+    padding: 4px;
+  }
+
+  .strip-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: var(--sp-3) var(--sp-4);
+    margin-left: calc(-1 * (var(--sp-4) + 1px));
+  }
+
+  .group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--sp-2) var(--sp-3);
+    padding-left: var(--sp-4);
+    border-left: 1px solid var(--border);
+    margin: 0;
+  }
+
+  .group-actions {
+    display: flex;
+    gap: var(--sp-2);
+    margin-left: var(--sp-1);
+  }
+
+  .pool-note {
+    align-self: center;
+    font-size: var(--fs-2xs);
+    color: var(--gold);
+  }
+
+  .forced-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--gold);
   }
 
   .strip-label {
     display: inline-flex;
     align-items: center;
     height: var(--ctrl-h);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     text-transform: uppercase;
     letter-spacing: 0.12em;
     color: var(--text-faint);
+    margin-right: var(--sp-1);
   }
 
+  /* Viewports: the checkbox list wraps inside its own column; the tools
+     (review pack, custom size, zoom) move under it as one block when the
+     window gets narrow. */
   .viewports {
-    border-bottom: none;
-    padding-top: 0;
-    margin-bottom: 4px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--sp-2) var(--sp-6);
+    margin-bottom: var(--sp-1);
+  }
+
+  .vp-list {
+    flex: 1 1 440px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 var(--sp-4);
+  }
+
+  .vp-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .vp-remove {
+    padding: 3px;
+    line-height: 0;
+  }
+
+  .vp-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--sp-2) var(--sp-3);
+    margin-left: auto;
   }
 
   .custom-add {
@@ -472,11 +1180,8 @@
     align-items: center;
     height: var(--ctrl-h);
     gap: 5px;
+    margin: 0;
     color: var(--text-faint);
-  }
-
-  .zoom {
-    margin-left: auto;
   }
 
   .zoom input[type='range'] {
@@ -485,17 +1190,12 @@
     padding: 0;
   }
 
-  .tiny {
-    padding: 0 4px;
-    font-size: 10px;
-  }
-
   .advanced {
     margin-bottom: 14px;
   }
 
   .advanced summary {
-    font-size: 11.5px;
+    font-size: var(--fs-xs);
     color: var(--text-faint);
     cursor: pointer;
     user-select: none;
@@ -507,8 +1207,8 @@
 
   .advanced-row {
     display: flex;
-    gap: 8px;
-    margin-top: 8px;
+    gap: var(--sp-2);
+    margin: var(--sp-2) 0 0;
   }
 
   .advanced-row input {
@@ -521,13 +1221,13 @@
     flex-wrap: wrap;
     gap: 18px;
     align-items: flex-start;
-    margin-bottom: 20px;
+    margin-bottom: var(--sp-5);
   }
 
   .side-panels {
     display: grid;
     grid-template-columns: 1.2fr 1fr;
-    gap: 16px;
+    gap: var(--sp-4);
   }
 
   @media (max-width: 1000px) {

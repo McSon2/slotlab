@@ -8,3 +8,6 @@ node_modules/
 # OS / misc
 .DS_Store
 *.log
+
+# Market reference work dir (scripts/market/fetch_market.py)
+.market-cache/

@@ -33,12 +33,20 @@ pub fn pick_review_ids(mode: &str, lut: &Lut) -> ReviewIds {
     let mut avg_pick = None;
     let mut best_diff = f64::INFINITY;
     // high = payout at the weighted 99.9th percentile of non-zero wins.
-    let mut nonzero: Vec<(u64, u64, u64)> = lut
-        .rows
-        .iter()
-        .filter(|r| r.payout_x100 > 0)
-        .map(|r| (r.payout_x100, r.weight, r.sim_id))
-        .collect();
+    // Only books the published LUT can actually draw (weight > 0): a
+    // weight-0 book exists in the books but a reviewer would never meet it.
+    // Falls back to every winning book if none is drawable.
+    let winning = |drawable_only: bool| -> Vec<(u64, u64, u64)> {
+        lut.rows
+            .iter()
+            .filter(|r| r.payout_x100 > 0 && (!drawable_only || r.weight > 0))
+            .map(|r| (r.payout_x100, r.weight, r.sim_id))
+            .collect()
+    };
+    let mut nonzero = winning(true);
+    if nonzero.is_empty() {
+        nonzero = winning(false);
+    }
     nonzero.sort_unstable_by_key(|&(p, _, _)| p);
     let nz_weight: u64 = nonzero.iter().map(|&(_, w, _)| w).sum();
 
@@ -84,17 +92,54 @@ pub fn pick_review_ids(mode: &str, lut: &Lut) -> ReviewIds {
     }
 }
 
+/// One line of the block. `one_in` is infinite when the picked book carries
+/// a zero weight in the published LUT (it exists in the books, the LUT just
+/// never draws it) or when the mode has no winning book at all — neither is
+/// worth printing as "~1/inf".
+fn format_pick(label: &str, p: &EventPick) -> String {
+    if p.payout == 0.0 && !p.one_in.is_finite() {
+        return format!("  {label:<11} : no winning book in this mode\n");
+    }
+    let odds = if p.one_in.is_finite() {
+        format!("~1/{:.0}", p.one_in)
+    } else {
+        "never drawn, LUT weight 0".to_string()
+    };
+    format!("  {label:<11} : event {}  ({:.2}x, {odds})\n", p.sim_id, p.payout)
+}
+
 /// Ready-to-paste text block for submission (one game = all its modes).
 pub fn format_review_block(game: &str, picks: &[ReviewIds]) -> String {
     let mut out = format!("Event IDs for review — {game}\n");
     for p in picks {
-        out.push_str(&format!(
-            "\n[{}]\n  average win : event {}  ({:.2}x, ~1/{:.0})\n  high win    : event {}  ({:.2}x, ~1/{:.0})\n  max win     : event {}  ({:.2}x, ~1/{:.0})\n",
-            p.mode,
-            p.average.sim_id, p.average.payout, p.average.one_in,
-            p.high.sim_id, p.high.payout, p.high.one_in,
-            p.max_win.sim_id, p.max_win.payout, p.max_win.one_in,
-        ));
+        out.push_str(&format!("\n[{}]\n", p.mode));
+        out.push_str(&format_pick("average win", &p.average));
+        out.push_str(&format_pick("high win", &p.high));
+        out.push_str(&format_pick("max win", &p.max_win));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(sim_id: u64, payout: f64, one_in: f64) -> EventPick {
+        EventPick { sim_id, payout, one_in }
+    }
+
+    #[test]
+    fn block_never_prints_inf() {
+        let ids = ReviewIds {
+            mode: "base".into(),
+            average: pick(74417, 1.0, f64::INFINITY),
+            high: pick(12, 250.0, 3816.2),
+            max_win: pick(0, 0.0, f64::INFINITY),
+        };
+        let text = format_review_block("demo", &[ids]);
+        assert!(!text.contains("inf"), "{text}");
+        assert!(text.contains("  average win : event 74417  (1.00x, never drawn, LUT weight 0)\n"));
+        assert!(text.contains("  high win    : event 12  (250.00x, ~1/3816)\n"));
+        assert!(text.contains("  max win     : no winning book in this mode\n"));
+    }
 }

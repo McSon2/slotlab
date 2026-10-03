@@ -24,8 +24,15 @@ pub fn resolve_publish_dirs(root: &Path) -> Vec<PathBuf> {
     // skipped, but the math-sdk "library" (lowercase, parent of
     // publish_files) is NOT.
     const SKIP: &[&str] = &[
-        "node_modules", "target", "dist", "build", "out", "Library",
-        "__pycache__", "venv", "env",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "out",
+        "Library",
+        "__pycache__",
+        "venv",
+        "env",
     ];
 
     let mut found = Vec::new();
@@ -56,10 +63,7 @@ pub fn resolve_publish_dirs(root: &Path) -> Vec<PathBuf> {
             let name = name.to_string_lossy();
             // '_' prefix = backup/scratch convention (math-sdk backups,
             // SlotLab's own _prebalance/…) — never offer those as games.
-            if name.starts_with('.')
-                || name.starts_with('_')
-                || SKIP.contains(&name.as_ref())
-            {
+            if name.starts_with('.') || name.starts_with('_') || SKIP.contains(&name.as_ref()) {
                 continue;
             }
             if is_publish_dir(&p) {

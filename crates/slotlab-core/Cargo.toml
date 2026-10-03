@@ -9,6 +9,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std"] }
 rand_xoshiro = "0.6"
+regex = "1"
 rayon = { version = "1.10", optional = true }
 
 [features]

@@ -16,7 +16,10 @@
   --border-strong: oklch(0.38 0.02 165);
   --text: oklch(0.92 0.012 95);
   --text-dim: oklch(0.66 0.015 130);
-  --text-faint: oklch(0.5 0.015 140);
+  /* L 0.6 → 4.7:1 on --bg-panel (AA for the small uppercase labels). */
+  --text-faint: oklch(0.6 0.015 140);
+  --row-line: oklch(0.26 0.015 165);
+  --row-hover: oklch(0.21 0.015 165);
 
   /* Gold: primary actions, selection, the casino "value". */
   --gold: oklch(0.82 0.13 88);
@@ -29,11 +32,52 @@
   --fail: oklch(0.68 0.19 25);
   --info: oklch(0.75 0.09 220);
 
+  /* Tinted surfaces for a status/accent: color-mix(<token> <n>%, transparent)
+     is the rule; these are the three strengths used everywhere. */
+  --tint-weak: 7%;
+  --tint: 12%;
+  --tint-strong: 30%;
+
+  /* Finding severity (Analyze, CrowdSim): one scale for the whole app. */
+  --sv-blocking: var(--fail);
+  --sv-serious: var(--warn);
+  --sv-minor: var(--gold);
+  --sv-context: var(--info);
+
+  /* Chart series (categorical, in order). */
+  --series-1: oklch(0.82 0.13 88);
+  --series-2: oklch(0.74 0.1 205);
+  --series-3: oklch(0.78 0.16 155);
+  --series-4: oklch(0.72 0.15 25);
+  --series-5: oklch(0.72 0.12 300);
+  --series-6: oklch(0.76 0.15 65);
+  --series-7: oklch(0.7 0.08 250);
+  --series-8: oklch(0.66 0.015 130);
+
   --font-body: 'Archivo Variable', 'Archivo', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 
+  /* Type scale — use these, not raw px. */
+  --fs-2xs: 10.5px; /* overlines, table headers, micro labels */
+  --fs-xs: 11.5px; /* captions, pills, hints */
+  --fs-sm: 12.5px; /* buttons, table cells, secondary text */
+  --fs-base: 13.5px; /* body */
+  --fs-md: 14.5px; /* emphasized values, card titles */
+  --fs-lg: 17px; /* section titles */
+  --fs-xl: 22px; /* page titles, hero numbers */
+
+  /* Spacing scale (4px grid). */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
   --r-s: 4px;
   --r-m: 8px;
+  --r-pill: 999px;
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -101,6 +145,37 @@ code {
   font-family: var(--font-mono);
   font-size: 0.92em;
   color: var(--gold);
+}
+
+a {
+  color: var(--info);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--info) 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  text-decoration-color: currentColor;
+}
+
+a:visited {
+  color: var(--info);
+}
+
+/* Visually hidden, still read by screen readers. */
+.sr-only {
+  position: absolute;
+  /* Pinned to the containing block's left edge: at its static position a
+     span inside a scrolled table escaped the clip and widened the page. */
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ---- Controls ---- */
@@ -171,9 +246,19 @@ input, select {
   font-size: 13px;
 }
 
-input:focus-visible, select:focus-visible, button:focus-visible {
-  outline: 2px solid oklch(0.82 0.13 88 / 0.55);
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+textarea:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid color-mix(in oklch, var(--gold) 55%, transparent);
   outline-offset: 1px;
+}
+
+summary {
+  cursor: pointer;
 }
 
 input[readonly] {
@@ -195,8 +280,8 @@ table {
 th, td {
   text-align: left;
   padding: 6px 12px;
-  border-bottom: 1px solid oklch(0.26 0.015 165);
-  font-size: 12.8px;
+  border-bottom: 1px solid var(--row-line);
+  font-size: var(--fs-sm);
 }
 
 th {
@@ -209,7 +294,12 @@ th {
 }
 
 tbody tr:hover {
-  background: oklch(0.21 0.015 165);
+  background: var(--row-hover);
+}
+
+/* Several tables stacked under each other (one per group): same columns. */
+table.fixed {
+  table-layout: fixed;
 }
 
 tbody tr:last-child td {
@@ -269,6 +359,27 @@ th.num {
   box-shadow: 0 0 6px currentColor;
 }
 
+/* Size variants (global — don't redefine them per page). */
+.pill.big {
+  font-size: var(--fs-sm);
+  padding: 3px 12px 3px 10px;
+}
+
+.pill.tiny {
+  font-size: 10px;
+  padding: 0 6px 0 5px;
+  gap: 4px;
+}
+
+.pill.tiny::before {
+  width: 5px;
+  height: 5px;
+}
+
+button.pill {
+  cursor: pointer;
+}
+
 .pill.green { color: var(--pass); background: oklch(0.78 0.16 155 / 0.1); border-color: oklch(0.78 0.16 155 / 0.25); }
 .pill.yellow { color: var(--warn); background: oklch(0.76 0.15 65 / 0.1); border-color: oklch(0.76 0.15 65 / 0.25); }
 .pill.red { color: var(--fail); background: oklch(0.68 0.19 25 / 0.12); border-color: oklch(0.68 0.19 25 / 0.3); }
@@ -298,6 +409,23 @@ th.num {
   border-color: oklch(0.68 0.19 25 / 0.4);
   background: oklch(0.68 0.19 25 / 0.07);
   color: var(--fail);
+}
+
+.banner.warn {
+  border-color: oklch(0.76 0.15 65 / 0.35);
+  background: oklch(0.76 0.15 65 / 0.07);
+}
+
+.banner.info {
+  border-color: color-mix(in oklch, var(--info) 35%, transparent);
+  background: color-mix(in oklch, var(--info) var(--tint-weak), transparent);
+}
+
+/* Inline form/field error (under a form, not a page-level banner). */
+.field-error {
+  color: var(--fail);
+  font-size: var(--fs-sm);
+  margin: var(--sp-2) 0 0;
 }
 
 progress {
@@ -390,4 +518,54 @@ progress::-webkit-progress-value {
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ---- Sub-navigation inside a page (one lens at a time) ---- */
+
+.view-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+
+.view-tabs button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 8px 16px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.view-tabs button:hover {
+  color: var(--text);
+  background: transparent;
+}
+
+.view-tabs button.active {
+  color: var(--gold);
+  border-bottom-color: var(--gold);
+  font-weight: 640;
+}
+
+.view-tabs .count {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background: color-mix(in oklch, var(--gold) var(--tint), transparent);
+  color: var(--gold);
+}
+
+.view-context {
+  margin-left: auto;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
 }

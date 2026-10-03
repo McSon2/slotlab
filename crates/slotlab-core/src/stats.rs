@@ -337,6 +337,45 @@ fn build_buckets(
     buckets
 }
 
+/// Retrouve la tranche d'un gain avec la règle même de `build_buckets` —
+/// gain nul → tranche zéro, sinon `max(début, 0.01) ≤ gain < fin`, bornes
+/// arrondies au centième — pour que tout ce qui se ventile par tranche
+/// ailleurs (provenance bonus/palier) retombe exactement sur ces tranches-ci.
+pub struct BucketLookup {
+    zero: Option<usize>,
+    /// (début effectif ×100, fin ×100, index dans la liste), croissants.
+    ranges: Vec<(u64, u64, usize)>,
+}
+
+impl BucketLookup {
+    pub fn new(buckets: &[Bucket]) -> Self {
+        let mut zero = None;
+        let mut ranges = Vec::with_capacity(buckets.len());
+        for (i, b) in buckets.iter().enumerate() {
+            if b.start == 0.0 && b.end == 0.0 {
+                zero = Some(i);
+            } else {
+                let start = ((b.start * 100.0).round() as u64).max(1);
+                ranges.push((start, (b.end * 100.0).round() as u64, i));
+            }
+        }
+        Self { zero, ranges }
+    }
+
+    /// `None` si aucune tranche listée ne contient ce gain (les tranches vides
+    /// sont omises) — jamais pour une ligne de la LUT qui les a construites.
+    pub fn find(&self, payout_x100: u64) -> Option<usize> {
+        if payout_x100 == 0 {
+            return self.zero;
+        }
+        let k = self.ranges.partition_point(|&(_, end, _)| end <= payout_x100);
+        self.ranges
+            .get(k)
+            .filter(|&&(start, _, _)| payout_x100 >= start)
+            .map(|&(_, _, i)| i)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +428,31 @@ mod tests {
         let s = analyze(&l, 1.0);
         let sum: f64 = s.buckets.iter().map(|b| b.rtp_contribution).sum();
         assert!((sum - s.rtp).abs() < 1e-9, "Σcontrib {} != rtp {}", sum, s.rtp);
+    }
+
+    #[test]
+    fn bucket_lookup_lands_every_lut_row_in_its_own_bucket() {
+        // Chaque ligne de la LUT doit retomber dans la tranche qui l'a comptée :
+        // on refait les poids par tranche via le lookup et on compare.
+        let l = lut(&[
+            (0, 700, 0),
+            (1, 200, 50),
+            (2, 60, 100),
+            (3, 30, 199),
+            (4, 9, 200),
+            (5, 5, 99_999),
+            (6, 1, 2_000_000),
+        ]);
+        let s = analyze(&l, 1.0);
+        let lookup = BucketLookup::new(&s.buckets);
+        let mut w = vec![0u64; s.buckets.len()];
+        for r in &l.rows {
+            w[lookup.find(r.payout_x100).expect("every row has a bucket")] += r.weight;
+        }
+        let expected: Vec<u64> = s.buckets.iter().map(|b| b.weight).collect();
+        assert_eq!(w, expected);
+        // 2 000 000 ×100 = 20 000x, le max : dans la dernière tranche.
+        assert_eq!(lookup.find(2_000_000), Some(s.buckets.len() - 1));
     }
 
     #[test]

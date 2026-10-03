@@ -5,6 +5,12 @@ members = [
     "crates/slotlab-app",
     "crates/slotlab-desktop",
 ]
+# `cargo run` / `cargo build` at the root target the CLI only: the workspace has
+# two binaries (slotlab, slotlab-desktop) and would otherwise be ambiguous.
+# It also keeps dev builds free of Tauri and of the `embed-ui` feature that
+# slotlab-desktop turns on (which requires frontend/dist to exist).
+# The desktop app is built via `cargo tauri build` inside crates/slotlab-desktop.
+default-members = ["crates/slotlab-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +18,7 @@ edition = "2021"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 anyhow = "1"
 

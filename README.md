@@ -63,23 +63,124 @@ exposed via cloudflared).
 
 ## Tabs
 
-- **Games** — game registry, RTP/hit/max win per mode, reload.
-- **Play** — multi-viewport (7 presets + custom), currency (fiat + XGC/XSC),
-  social mode, language, balance, sticky **force (mode, event id)**, bookmarks,
-  live spin feed (SSE), reset sessions, replay deep-links.
-- **Analyze** — full stats per mode (RTP, hit, break-even, CV volatility
-  and std/cost, CVaR@0.1%, ETL 40x/10kx, P≥5k/10k, weighted median…),
-  1-2-5 bucket distribution with RTP contribution, top payouts with
-  "▶ Play this book", and the **17 Mnemoo checks + 4 in-house checks**
+- **Games** — game registry, RTP/hit/max win per mode, reload, and **what
+  changed in the last build**: every load with a new fingerprint is recorded,
+  so a `run.py prod` that moved an RTP by a thousandth or halved a hit rate
+  leaves a trace instead of passing silently.
+- **Play** — multi-viewport (9 presets + custom, incl. the two aspect ratios a
+  review has refused a game over, and a **Review pack** button for the four it
+  always opens), currency (fiat + XGC/XSC), social mode, language, balance,
+  sticky **force (mode, event id)**, bookmarks, live spin feed (SSE), reset
+  sessions, replay deep-links, plus **QA scenarios**: fault injection in the
+  emulated RGS — leave the next round open (unpaid), walk the balance down to
+  the edge of a spin, arm an RGS error / HTTP 500 / a call that never answers
+  on any endpoint, add latency, or launch against a broken `rgs_url`. Four of
+  the studio's refusals are about states that cannot be reached by playing
+  normally; here they are one click.
+- **Analyze** — organised around *populations*: a whole mode, its spins
+  without bonus, all its bonuses, each bonus tier (number of trigger symbols,
+  whatever criteria opened it), each variant of a tier (tier × criteria) and
+  each criteria. Every population gets the same block, weighted by the
+  published LUT: frequency, RTP share, **median next to the average**,
+  percentiles P5…P99.9 (each replayable), min/max, std and CV, share paying
+  0x / at least the cost, share under 10x/20x/50x/100x (+ any threshold you
+  type), value carried by the top 1 %/10 %, retriggers (rate, mean, win with
+  vs without), free spins awarded/played, the bonus's own win
+  (`freeGameWins`), and sample size (books, effective outcomes). Views:
+  **Overview** (findings computed from the numbers — « half of the 4-scatter
+  bonuses pay under 9.2x while the average is 96.5x » —, every mode, tail
+  risk), **Explore** (tree + the distribution curve and bands of one
+  population, its breakdown, the same tier in every mode), **Compare** (any
+  populations of any modes: overlaid curves, bands, metric matrix), and the
+  **17 Mnemoo checks + 4 in-house checks** in **Compliance**
   (0.1x granularity, most-likely ≥ 1/1000, integer cost, star tier).
+  Two more lenses: **Win tiers** — the celebration ladder measured on the
+  published LUT mode by mode (read from the game's own `winLevelThresholds.ts`
+  when it has one): how often each plaque shows up, how many SECONDS it costs
+  the average spin, and a field to try another ladder before touching the game;
+  **Fleet** — the base mode of every registered game side by side, the only
+  place that says whether an RTP, a hit rate or a ceiling is normal here;
+  **Market** — every mode against the modes of the same kind of the slots the
+  market plays (base games of a close max win, double chances of the SAME
+  cost, bonus buys and all-or-nothing buys of a close price): each figure —
+  hit rate, the win ladder, max win odds, 6 000 spins without 500x, median
+  return of a buy, share refunding nothing, volatility… — as the peers'
+  spread (p10 · middle half p25–p75 · p90), their median, and where the mode
+  falls, with the most played peers listed.
 - **Search** — book search by min/max win, criteria
   (basegame/freegame/wincap…), event type present (freeSpinTrigger…),
   number of retriggers; trigger stats per mode; each hit can be forced or
   bookmarked.
+- **Scan** — every book of a mode read once, WEIGHTED BY THE LUT: the staging
+  invariants nothing else sees. Anticipation fired vs. deserved (early / late /
+  missing / cannot-trigger, against the real rule — the reel that follows the
+  one completing trigger − 1, intra-column on the last reel), scatters on the
+  visible window (padding excluded, which is where a naive scan goes wrong),
+  bonus tiers and their monotonicity, re-triggers, wild moves off the grid, the
+  share of rounds carrying each event, and the PACING in staging seconds
+  (mean / p50 / p95). The trigger size and the padding are derived from the
+  books; a mode that anticipates on every spin is flagged as such instead of
+  being reported as broken. Kept per build fingerprint, on disk.
+- **Preflight** — the pre-upload checklist, run against the files: ~28 text
+  rules over the game's sources, the shared kit and the BUILD (renderer,
+  bet-level guards, amount formatting, restricted terminology, social sweep,
+  `--ui-*` tokens, reduced motion, hygiene) plus the checks only this process
+  can make — ghost assets (`key=` vs `assets.ts`), version sync, book events
+  the frontend never names, orphan files in publish_files, oversized book
+  lines, and `verify_publish`: the LUT payout against the book payout, by id,
+  over every row. Each finding carries its file, its line, and the section of
+  the studio doc that justifies it.
+- **Challenge** — Stake challenge calculator from the mode's published LUT:
+  hit rate of any target multiplier, hunter-EV matrix (targets × awards,
+  verdict-colored: dead/thin/sweet/generous/giveaway), operator break-even
+  (turnover & spins = award ÷ house edge), per-award suggested target
+  (hardest still ≥ ×1.5 EV) and a single-challenge simulator (lone-claim
+  net, expected grind). Round multiplier = win ÷ total stake, so bonus
+  buys dilute themselves out.
 - **CrowdSim** — seeded Monte-Carlo cohorts (PoP, ruin, drawdown, streaks,
-  p5/p50/p95 balance curves) + RTP convergence up to 50M spins.
+  p5/p50/p95 balance curves) + RTP convergence up to 50M spins. **Player
+  feel** reads the frustrations of a mode, exact on the LUT and counted on the
+  cohort's own sessions. A base game: bonus **droughts** (1 000 spins with one
+  bonus or none), bonus **letdowns** (3+ bonuses in 300 spins, all under 20x
+  the stake), **dry spells** (longest run without a win), **broke before the
+  bonus** (a 100-stake deposit lost before the first bonus — estimated on
+  12 000 deposits) and **big wins out of reach** (6 000 spins without 500x).
+  A bought or costly round: **purchases that refund nothing** (under 25 % of
+  the price; all-or-nothing modes are read, not flagged). Every definition is
+  editable; the median ÷ average bonus sits next to its market band. Each
+  frustration past its line gets a **fix**: the LUT re-weighted (books
+  untouched, RTP kept), paid two or three ways — the base game, the big wins,
+  the bonus, the pops or the middle of a buy — each read as before → after
+  (hit rate, median bonus, wins ≥ 500x, refunds, max win, RTP budget per line,
+  and any other frustration it pushes past its line), the gentlest one
+  recommended, and any of them playable as a new cohort next to the original.
+  **Market**: each base mode is also read against the slots the market plays
+  with a close max win, and each double chance against the double chances of
+  the same cost — a 3x ante against the slots that have a 3x mode, the closest
+  max wins first (every mode of the slots the market plays NOW: the most
+  played slots of the last 30 days, from the top down until they make 90 % of
+  the slot turnover, instant games left out, from the certified lookup tables
+  StakeCruncher serves). SlotLab rebuilds this reference every day while it
+  runs (`market_refresh.rs`: today's ranking, only the new lookup tables are
+  downloaded, cache in `~/Library/Application Support/slotlab/market/`) and
+  swaps it in live; the Market tab shows the day of the ranking and an
+  « Update now » button; `crates/slotlab-core/data/market.json` (refreshed by
+  `scripts/market/fetch_market.py`, same rule and cache) is only the offline
+  fallback built in:
+  hit rate, wins ≥ 100/500/1 000/5 000x the stake,
+  max win odds, 6 000 spins without 500x/1 000x, volatility, as p25 / median /
+  p75. The **one fix for everything** then starts from the peers' median
+  (every rung of the ladder and the max win's odds on it, the RTP kept) and
+  takes each frustration's best way only as far as the market's middle half
+  allows.
 - **Review** — "Event IDs" block (average/high/max win per mode) ready to
-  paste for the Stake submission.
+  paste for the Stake submission, and a **client report**: the same math in
+  whole sentences (how often it pays, how much, how long before something big,
+  where the ceiling is), Markdown, ready to send.
+- **Assets** — what the player downloads to start and what the textures cost
+  in video memory, as a RANGE (mutually exclusive atlas scales and audio
+  formats), plus a **contact sheet** of every image the build ships: the one
+  check no rule replaces.
 - **Share** — the game's static build + emulated RGS behind a Cloudflare
   quick tunnel (`*.trycloudflare.com`): a playable link to send to a friend,
   with nothing to install on their end. Prerequisite: `brew install cloudflared`.
@@ -88,10 +189,12 @@ exposed via cloudflared).
 
 ```
 crates/slotlab-core   # pure (wasm-able): parse index.json/LUT, stats, checks,
-                      # crowdsim, review — all the formulas
+                      # crowdsim, review, celebration tiers, book invariants,
+                      # preflight rules — all the formulas and all the rules
 crates/slotlab-app    # binary: axum (UI+API, RGS TLS, share), books loader
                       # (2 MiB zstd blocks + .idx sidecar + mmap + double LRU),
-                      # sessions, rcgen TLS, cloudflared tunnel
+                      # sessions + fault injection, book scan jobs, build
+                      # history, rcgen TLS, cloudflared tunnel
 frontend/             # Vite + Svelte 5 + Chart.js (SPA, embedded in release)
 ```
 
@@ -109,3 +212,10 @@ the stream into 2 MiB zstd frames (`.blocks`) + an index
 sim_id → (block, offset) and search metadata (`.idx`). At read time:
 mmap + LRU of 128 decompressed blocks (~256 MiB) + LRU of parsed books.
 The full Tachyon (16 GB decompressed) runs with ~300 MB of RSS.
+
+A **book scan** (Scan tab) is the one pass that reads everything: blocks are
+decompressed straight from the mmap, in parallel, and deliberately NOT put
+through the LRU — a scan reads each block exactly once, and pushing them all
+through the cache would evict what the RGS is serving spins from. ~25 s for
+350 000 books, ~3 min for a seven-mode game; the result is kept on disk against
+the build's fingerprint, so it is computed once per `run.py prod`.

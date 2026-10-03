@@ -8,17 +8,25 @@ use std::sync::Arc;
 #[derive(Serialize, Clone)]
 pub struct StatusObject {
     #[serde(rename = "statusCode")]
-    pub status_code: &'static str,
+    pub status_code: String,
     #[serde(rename = "statusMessage")]
     pub status_message: String,
 }
 
 impl StatusObject {
     pub fn success() -> Self {
-        Self { status_code: "SUCCESS", status_message: "".into() }
+        Self {
+            status_code: "SUCCESS".into(),
+            status_message: String::new(),
+        }
     }
-    pub fn err(code: &'static str, msg: impl Into<String>) -> Self {
-        Self { status_code: code, status_message: msg.into() }
+    /// The code is owned rather than `&'static str`: fault injection sends
+    /// codes typed in the UI, and the RGS itself has no fixed list.
+    pub fn err(code: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self {
+            status_code: code.into(),
+            status_message: msg.into(),
+        }
     }
 }
 
@@ -115,13 +123,12 @@ pub struct ConfigObject {
     pub jurisdiction: Jurisdiction,
 }
 
-/// Default bet levels, in micro-units ($0.10 → $1,000).
+/// Default bet levels, in micro-units ($0.01 → $1,000).
 pub fn default_bet_levels() -> Vec<u64> {
     [
-        0.10f64, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.0, 1.20, 1.60, 2.0, 3.0,
-        4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 30.0, 40.0, 50.0, 60.0,
-        80.0, 100.0, 120.0, 160.0, 200.0, 300.0, 400.0, 500.0, 600.0, 800.0,
-        1000.0,
+        0.01f64, 0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.0, 1.20, 1.60, 2.0, 3.0,
+        4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0,
+        160.0, 200.0, 300.0, 400.0, 500.0, 600.0, 800.0, 1000.0,
     ]
     .iter()
     .map(|d| (d * 1_000_000.0).round() as u64)

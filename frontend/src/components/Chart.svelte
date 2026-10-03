@@ -15,6 +15,7 @@
     Filler,
     type ChartConfiguration,
   } from 'chart.js';
+  import { chartColors } from '../lib/populations';
 
   Chart.register(
     BarController,
@@ -30,16 +31,27 @@
     Filler,
   );
 
-  Chart.defaults.color = '#8b9b90';
-  Chart.defaults.borderColor = 'rgba(120, 140, 128, 0.15)';
   Chart.defaults.font.family = "'IBM Plex Mono', ui-monospace, monospace";
 
   interface Props {
     config: ChartConfiguration;
     height?: number;
+    /**
+     * What the chart shows, for screen readers (the canvas is an image to
+     * them). Defaults to the names of the plotted series.
+     */
+    label?: string;
   }
 
-  const { config, height = 260 }: Props = $props();
+  const { config, height = 260, label }: Props = $props();
+
+  const ariaLabel = $derived.by(() => {
+    if (label) return label;
+    const names = (config.data?.datasets ?? [])
+      .map((d) => d.label)
+      .filter((l): l is string => !!l);
+    return names.length ? `Chart: ${names.join(', ')}` : 'Chart';
+  });
 
   let canvas: HTMLCanvasElement;
   let chart: Chart | null = null;
@@ -55,6 +67,10 @@
   }
 
   onMount(() => {
+    // Tokens are resolved once the stylesheet is applied (not at import).
+    const c = chartColors();
+    Chart.defaults.color = c.text;
+    Chart.defaults.borderColor = c.grid;
     chart = new Chart(canvas, plainConfig());
     return () => chart?.destroy();
   });
@@ -69,6 +85,6 @@
   });
 </script>
 
-<div style="height: {height}px; position: relative; width: 100%;">
+<div style="height: {height}px; position: relative; width: 100%;" role="img" aria-label={ariaLabel}>
   <canvas bind:this={canvas}></canvas>
 </div>

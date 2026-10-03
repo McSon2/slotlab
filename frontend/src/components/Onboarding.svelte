@@ -1,7 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, type FoundGame } from '../lib/api';
-  import { app, refreshGames } from '../lib/stores.svelte';
+  import { onMount, tick, untrack } from 'svelte';
+  import { api } from '../lib/api';
+  import { GameAdder } from '../lib/addGame.svelte';
+  import { storageSet } from '../lib/storage';
+  import { app, errorText } from '../lib/stores.svelte';
+  import Icon from './Icon.svelte';
 
   let {
     trusted = false,
@@ -10,32 +13,54 @@
 
   // 0 welcome · 1 certificate · 2 first game · 3 ready
   let step = $state(0);
+  const steps = ['Welcome', 'Certificate', 'First game', 'Ready'];
+  const titleId = 'onboarding-title';
+
+  let dialogEl = $state<HTMLDialogElement>();
 
   // The prop is only a hint (App may still be fetching when we mount) —
   // ask the server ourselves so step 1 never wrongly shows "installed".
-  let tlsTrusted = $state(trusted);
+  let tlsTrusted = $state(untrack(() => trusted));
   let tlsBusy = $state(false);
   let tlsError = $state<string | null>(null);
 
+  const adder = new GameAdder();
+
+  /** Games present before this guide added any (reopened via "?"). */
+  const hasGames = $derived(app.games.length > 0);
+
   onMount(() => {
+    // Native modal: focus trap, Escape (→ `cancel`) and the backdrop for free.
+    if (dialogEl && !dialogEl.open) dialogEl.showModal();
     api.tlsStatus().then((s) => (tlsTrusted = s.trusted)).catch(() => {});
   });
 
-  let publishDir = $state('');
-  let gameBusy = $state(false);
-  let gameError = $state<string | null>(null);
-  let candidates = $state<FoundGame[]>([]);
-  let added = $state<string[]>([]);
+  /** Each step lands on its primary action. */
+  async function focusPrimary() {
+    await tick();
+    dialogEl?.querySelector<HTMLElement>('[data-primary]:not(:disabled)')?.focus();
+  }
 
-  const derivedName = $derived.by(() => {
-    const m = publishDir.match(/\/math\/games\/([^/]+)\/library\/publish_files\/?$/);
-    return m?.[1] ?? '';
+  $effect(() => {
+    void step;
+    void focusPrimary();
   });
 
+  let finished = false;
+
   function finish(openPlay: boolean) {
-    localStorage.setItem('slotlab.onboarded', '1');
-    if (openPlay) app.tab = 'play';
+    if (finished) return;
+    finished = true;
+    storageSet('slotlab.onboarded', '1');
+    if (openPlay) app.tab = app.games.length > 0 ? 'play' : 'games';
+    if (dialogEl?.open) dialogEl.close();
     onclose();
+  }
+
+  function onCancel(e: Event) {
+    // Escape = "Skip setup".
+    e.preventDefault();
+    finish(false);
   }
 
   async function installCa() {
@@ -46,174 +71,90 @@
       tlsTrusted = r.trusted;
       if (!r.trusted) tlsError = 'The certificate was not marked as trusted. Try again.';
     } catch (e) {
-      tlsError = e instanceof Error ? e.message : String(e);
+      tlsError = errorText(e);
     } finally {
       tlsBusy = false;
     }
+    // The install button is gone once trusted: land on "Continue".
+    if (tlsTrusted) void focusPrimary();
   }
-
-  /** Candidates not registered yet (by name or path). */
-  function freshOf(games: FoundGame[]): FoundGame[] {
-    return games.filter(
-      (g) => !app.games.some((x) => x.name === g.name || x.publishDir === g.path),
-    );
-  }
-
-  /** Single fresh game → add it right away; several → offer the list. */
-  async function handleFound(games: FoundGame[]) {
-    const fresh = freshOf(games);
-    if (fresh.length === 0) {
-      gameError =
-        games.length === 1
-          ? 'This game is already added.'
-          : `All ${games.length} games in this folder are already added.`;
-      return;
-    }
-    if (fresh.length === 1) {
-      await addOne(fresh[0].name, fresh[0].path);
-    } else {
-      candidates = fresh;
-    }
-  }
-
-  async function browse() {
-    gameError = null;
-    candidates = [];
-    try {
-      const r = await api.pickFolder();
-      if (r.cancelled) return;
-      if (r.error) {
-        gameError = r.error;
-        return;
-      }
-      const games = r.games ?? [];
-      if (games.length === 0) {
-        publishDir = r.picked ?? '';
-        gameError =
-          'No publish_files found in this folder. Pick a game folder (or any parent folder — SlotLab searches inside).';
-      } else {
-        await handleFound(games);
-      }
-    } catch (e) {
-      gameError = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  async function addAllCandidates() {
-    gameBusy = true;
-    gameError = null;
-    for (const c of [...candidates]) {
-      try {
-        await api.registerGame(c.name, c.path, '');
-        added = [...added, c.name];
-      } catch {
-        /* keep going */
-      }
-    }
-    await refreshGames();
-    if (added.length > 0) app.selectedGame = added[0];
-    candidates = [];
-    gameBusy = false;
-  }
-
-  async function addOne(name: string, path: string) {
-    gameBusy = true;
-    gameError = null;
-    try {
-      await api.registerGame(name, path, '');
-      await refreshGames();
-      app.selectedGame = name;
-      added = [...added, name];
-      candidates = candidates.filter((c) => c.name !== name);
-      publishDir = '';
-    } catch (e) {
-      gameError = e instanceof Error ? e.message : String(e);
-    } finally {
-      gameBusy = false;
-    }
-  }
-
-  async function addTyped() {
-    if (derivedName) {
-      await addOne(derivedName, publishDir.trim());
-      return;
-    }
-    // Hand-typed path that isn't a publish_files itself → resolve it.
-    gameBusy = true;
-    gameError = null;
-    candidates = [];
-    try {
-      const r = await api.resolvePath(publishDir.trim());
-      if (r.games.length === 0) {
-        gameError =
-          'No publish_files found at this path. Point to a game folder (or any parent folder).';
-      } else {
-        gameBusy = false;
-        await handleFound(r.games);
-      }
-    } catch (e) {
-      gameError = e instanceof Error ? e.message : String(e);
-    } finally {
-      gameBusy = false;
-    }
-  }
-
-  const steps = ['Welcome', 'Certificate', 'First game', 'Ready'];
 </script>
 
-<div class="veil" role="dialog" aria-modal="true" aria-label="SlotLab setup">
+<dialog
+  bind:this={dialogEl}
+  aria-labelledby={titleId}
+  oncancel={onCancel}
+  onclose={() => finish(false)}
+>
   <div class="card">
     <header>
-      <div class="dots" aria-hidden="true">
-        {#each steps as label, i (label)}
-          <span class="dot" class:on={i === step} class:done={i < step}></span>
-        {/each}
+      <div class="progress">
+        <div class="dots" aria-hidden="true">
+          {#each steps as label, i (label)}
+            <span class="dot" class:on={i === step} class:done={i < step}></span>
+          {/each}
+        </div>
+        <span class="step-count" aria-live="polite">
+          Step {step + 1} of {steps.length} · {steps[step]}
+        </span>
       </div>
-      <button class="ghost skip" onclick={() => finish(false)}>
-        Skip setup
-      </button>
+      <button class="ghost skip" onclick={() => finish(false)}>Skip setup</button>
     </header>
 
     {#if step === 0}
       <div class="body center">
-        <div class="chip">SL</div>
-        <h1>Welcome to SlotLab</h1>
+        <div class="chip" aria-hidden="true">SL</div>
+        <h1 id={titleId}>Welcome to SlotLab</h1>
         <p class="lead">
           Your dev &amp; QA bench for Stake Engine slots — play any game against
-          a local RGS, audit its math, and share a playable build in one click.
+          a local RGS, audit its math, and publish a playable build in one click.
         </p>
         <ul class="features">
           <li>
-            <span class="glyph">▶</span>
+            <span class="glyph"><Icon name="games" size={15} /></span>
+            <div>
+              <strong>Setup</strong>
+              <span>Add games from their math folder — books are imported for you.</span>
+            </div>
+          </li>
+          <li>
+            <span class="glyph"><Icon name="play" size={15} /></span>
             <div>
               <strong>Play</strong>
-              <span>Run games locally: viewports, forced outcomes, live spin feed, replays.</span>
+              <span>Run games against a local RGS: viewports, forced outcomes, replays, entry board.</span>
             </div>
           </li>
           <li>
-            <span class="glyph">∑</span>
+            <span class="glyph"><Icon name="analyze" size={15} /></span>
             <div>
-              <strong>Analyze</strong>
-              <span>RTP, volatility, distribution and 21 compliance checks per mode.</span>
+              <strong>Math</strong>
+              <span>RTP, volatility, distribution and compliance checks per mode; balance and crowd simulations.</span>
             </div>
           </li>
           <li>
-            <span class="glyph">⇗</span>
+            <span class="glyph"><Icon name="preflight" size={15} /></span>
             <div>
-              <strong>Share</strong>
-              <span>A public play link for anyone — nothing to install on their side.</span>
+              <strong>QA</strong>
+              <span>Scan the books, preflight the build, audit the assets, review before submission.</span>
+            </div>
+          </li>
+          <li>
+            <span class="glyph"><Icon name="publish" size={15} /></span>
+            <div>
+              <strong>Ship</strong>
+              <span>Publish a playable build — a temporary public link or your homelab.</span>
             </div>
           </li>
         </ul>
       </div>
       <footer>
         <span></span>
-        <button class="primary big" onclick={() => (step = 1)}>Get started</button>
+        <button class="primary big" data-primary onclick={() => (step = 1)}>Get started</button>
       </footer>
     {:else if step === 1}
       <div class="body">
-        <p class="overline">Step 1 · Local HTTPS certificate</p>
-        <h2>Let your browser trust the local casino server</h2>
+        <p class="overline">Local HTTPS certificate</p>
+        <h2 id={titleId}>Let your browser trust the local casino server</h2>
         <p>
           SlotLab emulates Stake's game server (the RGS) on your machine.
           Games only talk to it over <code>https</code>, so SlotLab needs its
@@ -221,87 +162,112 @@
           keychain.
         </p>
         <ul class="reassure">
-          <li>✓ macOS will ask for <strong>your session password</strong> — that's the standard system dialog, nothing else is changed.</li>
-          <li>✓ The certificate only vouches for <code>localhost</code>, is stored in <strong>your</strong> login keychain, and never leaves this Mac.</li>
-          <li>✓ You can remove it anytime in Keychain Access (search “SlotLab”).</li>
+          <li>
+            <Icon name="preflight" size={13} />
+            <span>macOS will ask for <strong>your session password</strong> — that's the standard system dialog, nothing else is changed.</span>
+          </li>
+          <li>
+            <Icon name="preflight" size={13} />
+            <span>The certificate only vouches for <code>localhost</code>, is stored in <strong>your</strong> login keychain, and never leaves this Mac.</span>
+          </li>
+          <li>
+            <Icon name="preflight" size={13} />
+            <span>You can remove it anytime in Keychain Access (search “SlotLab”).</span>
+          </li>
         </ul>
         {#if tlsTrusted}
-          <p class="status ok">✓ Certificate installed — you're good.</p>
+          <p class="status ok" role="status">
+            <Icon name="preflight" size={14} /> Certificate installed — you're good.
+          </p>
         {:else}
-          <button class="primary big" onclick={installCa} disabled={tlsBusy}>
+          <button class="primary big install" data-primary onclick={installCa} disabled={tlsBusy}>
             {tlsBusy ? 'Waiting for macOS…' : 'Install the certificate'}
           </button>
           {#if tlsError}
-            <p class="status err">{tlsError}</p>
+            <p class="status err" role="alert">{tlsError}</p>
           {/if}
         {/if}
       </div>
       <footer>
         <button class="ghost" onclick={() => (step = 0)}>Back</button>
         {#if tlsTrusted}
-          <button class="primary big" onclick={() => (step = 2)}>Continue</button>
+          <button class="primary big" data-primary onclick={() => (step = 2)}>Continue</button>
         {:else}
           <button class="ghost" onclick={() => (step = 2)}>Do this later</button>
         {/if}
       </footer>
     {:else if step === 2}
       <div class="body">
-        <p class="overline">Step 2 · Add your first game</p>
-        <h2>Point SlotLab at a game's math</h2>
+        <p class="overline">Add your first game</p>
+        <h2 id={titleId}>Point SlotLab at a game's math</h2>
         <p>
           Pick a game folder, a repo, or any parent folder — SlotLab digs out
           every <code>publish_files</code> inside, derives the names and
           imports the books on its own. Several games found = add them all in
           one click.
         </p>
-        <div class="add-row">
-          <button onclick={browse} disabled={gameBusy}>📁 Browse…</button>
-          <input
-            bind:value={publishDir}
-            placeholder="…or paste a path"
-            onkeydown={(e) => e.key === 'Enter' && publishDir.trim() && addTyped()}
-          />
-          <button
-            class="primary"
-            onclick={addTyped}
-            disabled={gameBusy || !publishDir.trim()}
-          >
-            {gameBusy ? 'Adding…' : derivedName ? `Add ${derivedName}` : 'Add'}
-          </button>
-        </div>
-        {#if candidates.length > 0}
-          <p class="dim found">
-            {candidates.length} games found:
-            <button class="primary" onclick={addAllCandidates} disabled={gameBusy}>
-              {gameBusy ? 'Adding…' : `Add all ${candidates.length}`}
-            </button>
-            <span class="dim">or pick them one by one —</span>
+        {#if hasGames && adder.added.length === 0}
+          <p class="faint small">
+            {app.games.length} game{app.games.length > 1 ? 's' : ''} already in SlotLab —
+            add another one, or continue.
           </p>
-          <div class="chips">
-            {#each candidates as c (c.path)}
+        {/if}
+        <form
+          class="add-row"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void adder.addTyped();
+          }}
+        >
+          <button type="button" data-primary onclick={adder.browse} disabled={adder.busy}>
+            <Icon name="folder" size={14} /> Browse…
+          </button>
+          <input
+            bind:value={adder.path}
+            aria-label="Game folder path"
+            placeholder="…or paste a path: a game folder or its publish_files"
+          />
+          <button type="submit" class="primary" disabled={adder.busy || !adder.path.trim()}>
+            {adder.busy ? 'Adding…' : adder.derivedName ? `Add ${adder.derivedName}` : 'Add'}
+          </button>
+        </form>
+        {#if adder.candidates.length > 0}
+          <p class="faint found">
+            {adder.candidates.length} games found:
+            <button class="primary" onclick={adder.addAll} disabled={adder.busy}>
+              {adder.busy ? 'Adding…' : `Add all ${adder.candidates.length}`}
+            </button>
+            <span>or pick them one by one —</span>
+          </p>
+          <div class="cands">
+            {#each adder.candidates as c (c.path)}
               <button
-                class="chip-btn"
+                class="cand"
                 title={c.path}
-                onclick={() => addOne(c.name, c.path)}
-                disabled={gameBusy}
+                onclick={() => adder.addOne(c.name, c.path)}
+                disabled={adder.busy}
               >
                 + {c.name}
               </button>
             {/each}
           </div>
         {/if}
-        {#if added.length > 0}
-          <p class="status ok">
-            ✓ Added: {added.join(', ')} — books are importing in the background.
+        {#if adder.added.length > 0}
+          <p class="status ok" role="status">
+            <Icon name="preflight" size={14} />
+            Added: {adder.added.join(', ')} — books are importing in the background.
           </p>
         {/if}
-        {#if gameError}
-          <p class="status err">{gameError}</p>
+        {#if adder.info}
+          <p class="status" role="status">{adder.info}</p>
+        {/if}
+        {#if adder.error}
+          <p class="status err" role="alert">{adder.error}</p>
         {/if}
       </div>
       <footer>
         <button class="ghost" onclick={() => (step = 1)}>Back</button>
-        {#if added.length > 0}
+        {#if adder.added.length > 0 || hasGames}
           <button class="primary big" onclick={() => (step = 3)}>Continue</button>
         {:else}
           <button class="ghost" onclick={() => (step = 3)}>Do this later</button>
@@ -309,54 +275,64 @@
       </footer>
     {:else}
       <div class="body center">
-        <div class="chip ok-chip">✓</div>
-        <h1>You're all set</h1>
+        <div class="chip ok-chip" aria-hidden="true"><Icon name="preflight" size={26} /></div>
+        <h1 id={titleId}>You're all set</h1>
         <p class="lead">
-          {#if added.length > 0}
-            <strong>{added.join(', ')}</strong> is importing its books in the
+          {#if adder.added.length > 0}
+            <strong>{adder.added.join(', ')}</strong>
+            {adder.added.length > 1 ? 'are' : 'is'} importing books in the
             background (a few minutes for a big game, one time only). The
             <strong>Games</strong> tab shows the progress; everything else is
             ready as soon as it turns green.
+          {:else if hasGames}
+            Your games are ready. Add more anytime from the
+            <strong>Games</strong> tab.
           {:else}
             Add a game anytime from the <strong>Games</strong> tab — everything
             else lights up from there.
           {/if}
         </p>
-        <p class="dim">
+        <p class="faint">
           Tip: reopen this guide anytime via the “?” button, bottom-left.
         </p>
       </div>
       <footer>
         <button class="ghost" onclick={() => (step = 2)}>Back</button>
-        <button class="primary big" onclick={() => finish(true)}>Open SlotLab</button>
+        <button class="primary big" data-primary onclick={() => finish(true)}>Open SlotLab</button>
       </footer>
     {/if}
   </div>
-</div>
+</dialog>
 
 <style>
-  .veil {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: grid;
-    place-items: center;
-    padding: 24px;
-    background:
-      radial-gradient(1200px 500px at 75% -10%, oklch(0.2 0.02 165 / 0.85), transparent 70%),
-      var(--bg);
-  }
-
-  .card {
-    width: min(680px, 100%);
-    min-height: 540px;
-    display: flex;
-    flex-direction: column;
+  dialog {
+    width: min(680px, calc(100% - 48px));
+    max-width: none;
+    max-height: calc(100% - 48px);
+    padding: 0;
+    color: var(--text);
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: var(--r-m);
-    box-shadow: 0 30px 80px oklch(0 0 0 / 0.45);
-    padding: 20px 34px 26px;
+    box-shadow: 0 30px 80px color-mix(in oklch, black 45%, transparent);
+  }
+
+  /* Same opaque veil as before: the app behind is inert anyway. */
+  dialog::backdrop {
+    background:
+      radial-gradient(
+        1200px 500px at 75% -10%,
+        color-mix(in oklch, var(--bg-panel, oklch(0.19 0.014 165)) 85%, transparent),
+        transparent 70%
+      ),
+      var(--bg, oklch(0.16 0.012 165));
+  }
+
+  .card {
+    min-height: 540px;
+    display: flex;
+    flex-direction: column;
+    padding: var(--sp-5) 34px 26px;
   }
 
   header {
@@ -364,6 +340,12 @@
     align-items: center;
     justify-content: space-between;
     margin-bottom: 18px;
+  }
+
+  .progress {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
   }
 
   .dots {
@@ -385,11 +367,16 @@
   }
 
   .dot.done {
-    background: oklch(0.82 0.13 88 / 0.45);
+    background: color-mix(in oklch, var(--gold) 45%, transparent);
+  }
+
+  .step-count {
+    font-size: var(--fs-xs);
+    color: var(--text-faint);
   }
 
   .skip {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-faint);
   }
 
@@ -413,34 +400,34 @@
     border-radius: 50%;
     background: var(--gold);
     color: var(--gold-ink);
-    font-size: 21px;
+    font-size: var(--fs-xl);
     font-weight: 800;
     margin-bottom: 18px;
     box-shadow:
       0 0 0 5px var(--bg-panel),
-      0 0 0 6.5px oklch(0.82 0.13 88 / 0.4);
+      0 0 0 6.5px color-mix(in oklch, var(--gold) 40%, transparent);
   }
 
   .ok-chip {
     background: var(--pass);
-    color: oklch(0.2 0.05 155);
+    color: var(--bg-deep);
     box-shadow:
       0 0 0 5px var(--bg-panel),
-      0 0 0 6.5px oklch(0.78 0.16 155 / 0.4);
+      0 0 0 6.5px color-mix(in oklch, var(--pass) 40%, transparent);
   }
 
   h1 {
-    font-size: 24px;
-    margin-bottom: 8px;
+    font-size: var(--fs-xl);
+    margin-bottom: var(--sp-2);
   }
 
   h2 {
-    font-size: 19px;
+    font-size: var(--fs-lg);
     margin-bottom: 10px;
   }
 
   .lead {
-    font-size: 14px;
+    font-size: var(--fs-md);
     color: var(--text-dim);
     max-width: 46ch;
     margin: 0 0 22px;
@@ -452,7 +439,7 @@
     margin: 0;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: var(--sp-3);
     text-align: left;
   }
 
@@ -476,21 +463,37 @@
 
   .features span:not(.glyph) {
     color: var(--text-dim);
-    font-size: 12.5px;
+    font-size: var(--fs-sm);
   }
 
   .reassure {
     list-style: none;
-    padding: 14px 16px;
-    margin: 14px 0 20px;
+    padding: 14px var(--sp-4);
+    margin: 14px 0 var(--sp-5);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--sp-2);
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--r-s);
-    font-size: 12.5px;
+    font-size: var(--fs-sm);
     color: var(--text-dim);
+  }
+
+  .reassure li {
+    display: flex;
+    gap: var(--sp-2);
+    align-items: baseline;
+  }
+
+  .reassure li > :global(svg) {
+    color: var(--pass);
+    position: relative;
+    top: 2px;
+  }
+
+  .install {
+    align-self: flex-start;
   }
 
   .add-row {
@@ -499,34 +502,50 @@
     margin-top: 14px;
   }
 
+  .add-row button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
   .add-row input {
     flex: 1;
-    font-family: var(--font-mono);
-    font-size: 12px;
+    min-width: 0;
+    font-size: var(--fs-sm);
   }
 
   .found {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
-    margin: 14px 0 8px;
-    font-size: 12.5px;
+    margin: 14px 0 var(--sp-2);
+    font-size: var(--fs-sm);
   }
 
-  .chips {
+  .cands {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
   }
 
-  .chip-btn {
+  .cand {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--fs-xs);
+  }
+
+  .small {
+    font-size: var(--fs-sm);
+    margin: 0;
   }
 
   .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     margin: 14px 0 0;
-    font-size: 13px;
+    font-size: var(--fs-base);
+    color: var(--text-dim);
   }
 
   .status.ok {
@@ -539,7 +558,7 @@
 
   .primary.big {
     padding: 9px 22px;
-    font-size: 13.5px;
+    font-size: var(--fs-base);
   }
 
   footer {
@@ -547,9 +566,5 @@
     align-items: center;
     justify-content: space-between;
     margin-top: 22px;
-  }
-
-  .dim {
-    color: var(--text-faint);
   }
 </style>

@@ -1,167 +1,120 @@
 <script lang="ts">
-  import { api, fmtPct, fmtX, playUrlFor, type FoundGame } from '../lib/api';
-  import { app, refreshGames } from '../lib/stores.svelte';
+  import {
+    api,
+    fmtInt,
+    fmtOneIn,
+    fmtPct,
+    fmtX,
+    playUrlFor,
+    type HistoryReport,
+  } from '../lib/api';
+  import { GameAdder } from '../lib/addGame.svelte';
+  import { app, refreshGames, run } from '../lib/stores.svelte';
+  import ConfirmButton from '../components/ConfirmButton.svelte';
+  import Icon from '../components/Icon.svelte';
 
-  let publishDir = $state('');
-  let busy = $state(false);
-  let formError = $state<string | null>(null);
-  let info = $state<string | null>(null);
-  /** Multiple games found (repo root) → the user picks. */
-  let candidates = $state<FoundGame[]>([]);
+  // What the last `run.py prod` changed. Every panel of the app shows the
+  // CURRENT numbers; this is the only one that shows a move.
+  let history = $state<HistoryReport | null>(null);
 
-  /** Candidates not registered yet (by name or path). */
-  function freshOf(games: FoundGame[]): FoundGame[] {
-    return games.filter(
-      (g) => !app.games.some((x) => x.name === g.name || x.publishDir === g.path),
+  $effect(() => {
+    const name = app.selectedGame;
+    if (!name) {
+      history = null;
+      return;
+    }
+    api.history(name).then((h) => (history = h)).catch(() => (history = null));
+  });
+
+  /**
+   * Rates keep the app-wide 2 decimals — unless both ends round to the same
+   * text, where a diff that reads "96.50 % → 96.50 %" would hide the move.
+   */
+  function fmtValue(field: string, v: number, other: number): string {
+    if (!Number.isFinite(v)) return 'never';
+    if (field === 'rtp' || field === 'hitRate') {
+      return fmtPct(v) === fmtPct(other) ? fmtPct(v, 4) : fmtPct(v);
+    }
+    if (field === 'maxPayout') return fmtX(v, 0);
+    if (field.endsWith('OneIn')) return fmtOneIn(v);
+    if (field === 'outcomes') return fmtInt(v);
+    return v.toFixed(3);
+  }
+
+  function when(ms: number): string {
+    return new Date(ms).toLocaleString();
+  }
+
+  const adder = new GameAdder({ toast: true });
+
+  /** Games being reloaded (their button shows it). */
+  let reloading = $state<Record<string, boolean>>({});
+
+  async function remove(gameName: string) {
+    await run(
+      async () => {
+        await api.removeGame(gameName);
+        await refreshGames();
+      },
+      { ok: `${gameName} removed from SlotLab`, error: `Could not remove ${gameName}` },
     );
   }
 
-  /** Single fresh game → add it right away; several → offer the list. */
-  async function handleFound(games: FoundGame[]) {
-    const fresh = freshOf(games);
-    if (fresh.length === 0) {
-      info =
-        games.length === 1
-          ? 'This game is already added.'
-          : `All ${games.length} games in this folder are already added.`;
-      return;
-    }
-    if (fresh.length === 1) {
-      if (await addOne(fresh[0].name, fresh[0].path)) publishDir = '';
-    } else {
-      candidates = fresh;
-    }
-  }
-
-  /** Derives the game_id from `<repo>/math/games/<id>/library/publish_files`. */
-  const derivedName = $derived.by(() => {
-    const m = publishDir.match(/\/math\/games\/([^/]+)\/library\/publish_files\/?$/);
-    return m?.[1] ?? '';
-  });
-
-  async function browse() {
-    formError = null;
-    info = null;
-    candidates = [];
-    try {
-      const r = await api.pickFolder();
-      if (r.cancelled) return;
-      if (r.error) {
-        formError = r.error;
-        return;
-      }
-      const games = r.games ?? [];
-      if (games.length === 0) {
-        publishDir = r.picked ?? '';
-        formError =
-          'No publish_files found in this folder. Pick a game folder (or any parent folder — SlotLab searches inside).';
-      } else {
-        await handleFound(games);
-      }
-    } catch (e) {
-      formError = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  async function addOne(name: string, path: string) {
-    busy = true;
-    formError = null;
-    try {
-      await api.registerGame(name, path, '');
-      await refreshGames();
-      app.selectedGame = name;
-      return true;
-    } catch (e) {
-      formError = e instanceof Error ? e.message : String(e);
-      return false;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function addAllCandidates() {
-    busy = true;
-    for (const g of candidates) {
-      try {
-        await api.registerGame(g.name, g.path, '');
-      } catch {
-        /* ignore, keep going */
-      }
-    }
-    await refreshGames();
-    if (candidates[0]) app.selectedGame = candidates[0].name;
-    candidates = [];
-    busy = false;
-  }
-
-  async function register() {
-    formError = null;
-    info = null;
-    candidates = [];
-    // Fast path: the typed path is already a publish_files.
-    if (derivedName) {
-      if (await addOne(derivedName, publishDir.trim())) publishDir = '';
-      return;
-    }
-    // Otherwise resolve it (game folder, repo, any parent folder).
-    const r = await api.resolvePath(publishDir.trim());
-    if (r.games.length === 0) {
-      formError =
-        'No publish_files found. Use "Browse" or paste a game (or parent) folder path.';
-      return;
-    }
-    await handleFound(r.games);
-  }
-
-  async function remove(gameName: string) {
-    if (!confirm(`Remove ${gameName} from SlotLab? (math files are left untouched)`)) return;
-    await api.removeGame(gameName);
-    await refreshGames();
-  }
-
   async function reload(gameName: string) {
-    busy = true;
-    try {
-      await api.reloadGame(gameName);
-      await refreshGames();
-    } catch (e) {
-      formError = e instanceof Error ? e.message : String(e);
-    } finally {
-      busy = false;
-    }
+    reloading[gameName] = true;
+    await run(
+      async () => {
+        await api.reloadGame(gameName);
+        await refreshGames();
+      },
+      { ok: `${gameName} reloaded`, error: `Could not reload ${gameName}` },
+    );
+    reloading[gameName] = false;
   }
+
+  const fmtCost = (c: number) => fmtX(c, Number.isInteger(c) ? 0 : 2);
 </script>
 
 <section>
   <p class="overline">Add a game</p>
-  <div class="add-row">
-    <button onclick={browse} disabled={busy}>📁 Browse…</button>
-    <input
-      bind:value={publishDir}
-      placeholder="…or paste a path: game folder, or its publish_files"
-      onkeydown={(e) => e.key === 'Enter' && register()}
-    />
-    <button class="primary" onclick={register} disabled={busy || !publishDir.trim()}>
-      {busy ? 'Loading…' : derivedName ? `Add ${derivedName}` : 'Add'}
+  <form
+    class="add-row"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void adder.addTyped();
+    }}
+  >
+    <button type="button" onclick={adder.browse} disabled={adder.busy}>
+      <Icon name="folder" size={14} /> Browse…
     </button>
-  </div>
-  {#if info}
-    <p class="form-note">{info}</p>
+    <input
+      bind:value={adder.path}
+      aria-label="Game folder path"
+      placeholder="…or paste a path: a game folder or its publish_files"
+    />
+    <button type="submit" class="primary" disabled={adder.busy || !adder.path.trim()}>
+      {adder.busy ? 'Adding…' : adder.derivedName ? `Add ${adder.derivedName}` : 'Add'}
+    </button>
+  </form>
+  {#if adder.info}
+    <p class="form-note" role="status">{adder.info}</p>
   {/if}
-  {#if candidates.length > 0}
+  {#if adder.candidates.length > 0}
     <div class="candidates">
       <p class="dim">
-        {candidates.length} games found in this folder:
-        <button class="primary" onclick={addAllCandidates} disabled={busy}>
-          {busy ? 'Adding…' : `Add all ${candidates.length}`}
+        {adder.candidates.length} games found in this folder:
+        <button class="primary" onclick={adder.addAll} disabled={adder.busy}>
+          {adder.busy ? 'Adding…' : `Add all ${adder.candidates.length}`}
         </button>
+        <span class="faint">or pick them one by one</span>
       </p>
-      <div class="chips">
-        {#each candidates as c (c.path)}
+      <div class="cands">
+        {#each adder.candidates as c (c.path)}
           <button
-            class="chip-btn"
+            class="cand"
             title={c.path}
-            onclick={() => addOne(c.name, c.path).then((ok) => ok && (candidates = candidates.filter((x) => x.path !== c.path)))}
+            disabled={adder.busy}
+            onclick={() => adder.addOne(c.name, c.path)}
           >
             + {c.name}
           </button>
@@ -169,17 +122,69 @@
       </div>
     </div>
   {/if}
-  {#if formError}
-    <p class="form-error">{formError}</p>
+  {#if adder.error}
+    <p class="field-error" role="alert">{adder.error}</p>
   {/if}
 </section>
+
+{#if history && history.diff.length > 0}
+  <section>
+    <p class="overline">
+      What changed in the last build
+      <span class="faint">
+        {history.snapshots.length > 1
+          ? when(history.snapshots[history.snapshots.length - 2].takenAt) +
+            ' → ' +
+            when(history.snapshots[history.snapshots.length - 1].takenAt)
+          : ''}
+      </span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Mode</th><th>Metric</th>
+          <th class="num">Before</th><th class="num">After</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each history.diff as d (d.mode)}
+          {#if d.status !== 'changed'}
+            <tr>
+              <td>{d.mode}</td>
+              <td colspan="3"><span class="pill {d.status === 'added' ? 'green' : 'red'}">{d.status}</span></td>
+            </tr>
+          {:else}
+            {#each d.changes as c (c.field)}
+              <tr class:notable={c.notable}>
+                <td>{c.field === d.changes[0].field ? d.mode : ''}</td>
+                <td>{c.label}{#if c.notable}<span class="sr-only"> (moved)</span>{/if}</td>
+                <td class="num faint">{fmtValue(c.field, c.before, c.after)}</td>
+                <td class="num">{fmtValue(c.field, c.after, c.before)}</td>
+              </tr>
+            {/each}
+          {/if}
+        {/each}
+      </tbody>
+    </table>
+    <p class="note faint">
+      Recorded whenever a game is loaded with files it has not seen before, so a
+      regression that moves no other indicator still leaves a trace. Highlighted
+      rows moved by more than rounding.
+    </p>
+  </section>
+{/if}
 
 <section>
   <p class="overline">Games ({app.games.length})</p>
   {#each app.games as game (game.name)}
     <article class="game" class:selected={app.selectedGame === game.name}>
       <header>
-        <button class="ghost name" onclick={() => (app.selectedGame = game.name)}>
+        <button
+          class="name"
+          aria-pressed={app.selectedGame === game.name}
+          title="Make it the current game"
+          onclick={() => (app.selectedGame = game.name)}
+        >
           {game.name}
         </button>
         {#if !game.loaded}
@@ -190,31 +195,54 @@
           <span class="pill green">ready</span>
         {/if}
         {#if game.servedUrl}
-          <a
-            class="served"
-            href={game.imported ? playUrlFor(game.name, game.servedUrl) : undefined}
-            class:disabled={!game.imported}
-            target="_blank"
-            rel="noreferrer"
-            title={game.imported
-              ? 'Open the playable game in a tab'
-              : 'Importing books…'}
-          >
-            open game ⇗
-          </a>
+          {#if game.imported}
+            <a
+              class="served"
+              href={playUrlFor(game.name, game.servedUrl)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open game<span class="sr-only"> (new tab)</span>
+              <Icon name="link" size={11} />
+            </a>
+          {:else}
+            <span class="faint small">Open game — available once the books are imported</span>
+          {/if}
         {:else if game.loaded}
-          <span class="faint">no frontend build detected</span>
+          <span class="faint small">no frontend build detected</span>
         {/if}
         <span class="spacer"></span>
-        <button class="ghost" onclick={() => reload(game.name)}>Reload</button>
-        <button class="ghost danger" onclick={() => remove(game.name)}>Remove</button>
+        <button
+          class="ghost"
+          onclick={() => reload(game.name)}
+          disabled={reloading[game.name]}
+          aria-label="Reload {game.name}"
+        >
+          {reloading[game.name] ? 'Reloading…' : 'Reload'}
+        </button>
+        <ConfirmButton
+          onconfirm={() => remove(game.name)}
+          confirmLabel="Remove from SlotLab?"
+          title="Math files are left untouched"
+          ariaLabel="Remove {game.name}"
+        >
+          Remove
+        </ConfirmButton>
       </header>
-      <p class="faint path">{game.publishDir}</p>
+      <p class="faint path" title={game.publishDir}>{game.publishDir}</p>
       {#if game.error}
-        <p class="form-error">{game.error}</p>
+        <p class="field-error">{game.error}</p>
       {/if}
       {#if game.modes.length > 0}
-        <table>
+        <table class="fixed modes">
+          <colgroup>
+            <col />
+            <col class="c-cost" />
+            <col class="c-rate" />
+            <col class="c-rate" />
+            <col class="c-max" />
+            <col class="c-books" />
+          </colgroup>
           <thead>
             <tr>
               <th>Mode</th>
@@ -228,17 +256,20 @@
           <tbody>
             {#each game.modes as m (m.name)}
               <tr>
-                <td>
+                <td
+                  class="mode"
+                  title={m.aliases.length > 0 ? `${m.name} (alias: ${m.aliases.join(', ')})` : m.name}
+                >
                   {m.name}
                   {#if m.aliases.length > 0}
                     <span class="faint">(alias: {m.aliases.join(', ')})</span>
                   {/if}
                 </td>
-                <td class="num">{m.cost}x</td>
-                <td class="num">{fmtPct(m.rtp, 4)}</td>
+                <td class="num">{fmtCost(m.cost)}</td>
+                <td class="num">{fmtPct(m.rtp)}</td>
                 <td class="num">{fmtPct(m.hitRate)}</td>
                 <td class="num">{fmtX(m.maxPayout, 0)}</td>
-                <td class="num">{m.outcomeCount.toLocaleString('en-US')}</td>
+                <td class="num">{fmtInt(m.outcomeCount)}</td>
               </tr>
             {/each}
           </tbody>
@@ -248,62 +279,72 @@
   {/each}
   {#if app.games.length === 0}
     <p class="dim">
-      Paste the path of a <code>publish_files</code> folder above —
-      SlotLab derives the name, imports the books and detects the frontend
-      build on its own.
+      Browse to a game folder above (or paste its path) — SlotLab finds its
+      <code>publish_files</code>, derives the name, imports the books and
+      detects the frontend build on its own.
     </p>
   {/if}
 </section>
 
 <style>
+  tr.notable td {
+    color: var(--warn);
+  }
+
   section {
     margin-bottom: 28px;
   }
 
   .add-row {
     display: flex;
-    gap: 10px;
+    gap: var(--sp-2);
+  }
+
+  .add-row button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .add-row input {
     flex: 1;
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  .form-error {
-    color: var(--fail);
-    margin: 8px 0 0;
-    font-size: 12.5px;
+    min-width: 0;
+    font-size: var(--fs-sm);
   }
 
   .form-note {
     color: var(--text-dim);
-    margin: 8px 0 0;
-    font-size: 12.5px;
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-sm);
   }
 
   .candidates {
-    margin-top: 12px;
+    margin-top: var(--sp-3);
   }
 
   .candidates p {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 0 0 8px;
-    font-size: 12.5px;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin: 0 0 var(--sp-2);
+    font-size: var(--fs-sm);
   }
 
-  .chips {
+  .cands {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
   }
 
-  .chip-btn {
+  .cand {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--fs-xs);
+  }
+
+  .note {
+    font-size: var(--fs-xs);
+    margin: var(--sp-2) 0 0;
   }
 
   .game {
@@ -318,14 +359,25 @@
   .game header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    flex-wrap: wrap;
+    gap: 6px var(--sp-3);
   }
 
+  /* The game name IS the selector: styled as the title, not as a button. */
   .game .name {
-    font-size: 15px;
+    font-size: var(--fs-md);
     font-weight: 680;
     color: var(--text);
+    background: transparent;
+    border-color: transparent;
     padding: 2px 6px 2px 0;
+  }
+
+  .game .name:hover:not(:disabled) {
+    background: transparent;
+    border-color: transparent;
+    text-decoration: underline;
+    text-underline-offset: 3px;
   }
 
   .game.selected .name {
@@ -333,7 +385,10 @@
   }
 
   .served {
-    font-size: 11.5px;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    font-size: var(--fs-xs);
     color: var(--info);
     text-decoration: none;
   }
@@ -342,9 +397,8 @@
     text-decoration: underline;
   }
 
-  .served.disabled {
-    color: var(--text-faint);
-    pointer-events: none;
+  .small {
+    font-size: var(--fs-xs);
   }
 
   .spacer {
@@ -353,11 +407,37 @@
 
   .path {
     font-family: var(--font-mono);
-    font-size: 11px;
-    margin: 2px 0 8px;
+    font-size: var(--fs-2xs);
+    margin: 2px 0 var(--sp-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   table {
     max-width: 860px;
+  }
+
+  /* Same columns for every game, so the numbers line up down the page. */
+  .modes .c-cost {
+    width: 80px;
+  }
+
+  .modes .c-rate {
+    width: 104px;
+  }
+
+  .modes .c-max {
+    width: 112px;
+  }
+
+  .modes .c-books {
+    width: 112px;
+  }
+
+  .modes .mode {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

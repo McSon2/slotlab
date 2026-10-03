@@ -18,11 +18,12 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rust-embed = { version = "8", optional = true }
 mime_guess = "2"
 zstd = "0.13"
+flate2 = "1"
 memmap2 = "0.9"
 lru = "0.12"
 bincode = "1"

@@ -3,594 +3,636 @@
     api,
     fmtPct,
     fmtX,
-    fmtOneIn,
     bookmarksApi,
     type ModeStats,
     type GameCheckReport,
-    type Check,
-    type ModeCompliance,
     type ModeBonusStats,
+    type ModeTiers,
+    type TierSpec,
   } from '../lib/api';
-  import { app } from '../lib/stores.svelte';
-  import Chart from '../components/Chart.svelte';
+  import { app, goTo, run, errorText } from '../lib/stores.svelte';
+  import { storageGetJson, storageSetJson } from '../lib/storage';
+  import { fx, oneIn, refId, type ModePopulations, type PopRef } from '../lib/populations';
+  import { allFindings, type Target } from '../lib/findings';
+  import Overview from '../components/analyze/Overview.svelte';
+  import Explore from '../components/analyze/Explore.svelte';
+  import Compare from '../components/analyze/Compare.svelte';
+  import Compliance from '../components/analyze/Compliance.svelte';
+  import WinTiers from '../components/analyze/WinTiers.svelte';
+  import Fleet from '../components/analyze/Fleet.svelte';
+  import Market from '../components/analyze/Market.svelte';
+  import Mechanics from '../components/analyze/Mechanics.svelte';
+  import SessionReach from '../components/analyze/SessionReach.svelte';
 
-  type View = 'overview' | 'compliance' | 'distribution' | 'bonus' | 'risk';
+  /**
+   * Analyze — one question per view:
+   *   Overview    is the game sound? findings, every mode, the selected mode's spins;
+   *   Explore     what does a population really pay? (mode, base spins, each
+   *               bonus, tier, variant, criteria — distribution, not just averages);
+   *   Compare     how do populations differ? (any of them, any mode, side by side);
+   *   Mechanics   what do the events show the player? (every field, weighted by the LUT);
+   *   Compliance · Win tiers · Fleet — unchanged.
+   */
+  type View = 'overview' | 'explore' | 'mechanics' | 'compare' | 'compliance' | 'tiers' | 'fleet' | 'market';
 
   let stats = $state<{ mode: string; stats: ModeStats }[]>([]);
   let checks = $state<GameCheckReport | null>(null);
+  let pops = $state<ModePopulations[]>([]);
   let bonusStats = $state<ModeBonusStats[]>([]);
+  let tiers = $state<{ report: ModeTiers; spec: TierSpec }[]>([]);
+  let ladderSource = $state('');
   let selectedMode = $state('');
+  /** Selected population, per mode — switching modes keeps each one's place. */
+  let selectedKey = $state<Record<string, string>>({});
   let view = $state<View>('overview');
   let error = $state<string | null>(null);
-  let forcedMsg = $state<string | null>(null);
+  let popsError = $state<string | null>(null);
+  let bonusError = $state<string | null>(null);
+  let tiersError = $state<string | null>(null);
+  /** Stats and checks of the selected game on their way. */
+  let loading = $state(false);
+  let pinned = $state<PopRef[]>([]);
+  let customThresholds = $state<number[]>([]);
+  /** Populations and celebration ladders read (or failed): findings are complete. */
+  let analysisReady = $state(false);
+  let loadedGame = '';
 
   $effect(() => {
     if (app.selectedGame) void load(app.selectedGame);
   });
 
+  // ── Per-game conveniences (compare set, extra thresholds) ──
+  function storageKey(game: string) {
+    return `slotlab.analyze.${game}`;
+  }
+
+  function restore(game: string) {
+    const v = storageGetJson<{ pinned?: unknown; thresholds?: unknown }>(storageKey(game), {});
+    pinned = Array.isArray(v?.pinned) ? (v.pinned as PopRef[]) : [];
+    customThresholds = Array.isArray(v?.thresholds)
+      ? v.thresholds.filter((x: unknown): x is number => typeof x === 'number')
+      : [];
+  }
+
+  function persist() {
+    if (!loadedGame) return;
+    storageSetJson(storageKey(loadedGame), { pinned, thresholds: customThresholds });
+  }
+
   async function load(gameName: string) {
     error = null;
+    if (gameName !== loadedGame) {
+      analysisReady = false;
+      loadedGame = gameName;
+      restore(gameName);
+      selectedKey = {};
+      // Never show the previous game's numbers under the new one's name.
+      stats = [];
+      checks = null;
+      pops = [];
+      bonusStats = [];
+      tiers = [];
+      popsError = bonusError = tiersError = null;
+    }
+    loading = true;
+    // Every source at once: they are independent, and chained they cost one
+    // round trip each (the server runs them side by side).
+    const extras = Promise.all([loadPops(gameName), loadBonus(gameName), loadTiers(gameName)]);
     try {
-      const [s, c] = await Promise.all([
-        api.gameStats(gameName),
-        api.gameChecks(gameName),
-      ]);
+      const [s, c] = await Promise.all([api.gameStats(gameName), api.gameChecks(gameName)]);
+      if (gameName !== loadedGame) return;
       stats = s.modes;
       checks = c;
-      // Bonus stats need the books import — non-fatal if unavailable.
-      try {
-        bonusStats = (await api.bonusStats(gameName)).modes;
-      } catch {
-        bonusStats = [];
-      }
       if (!stats.some((m) => m.mode === selectedMode)) {
         selectedMode = stats[0]?.mode ?? '';
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      if (gameName === loadedGame) error = errorText(e);
+      return;
+    } finally {
+      if (gameName === loadedGame) loading = false;
+    }
+    await extras;
+    if (gameName !== loadedGame) return;
+    analysisReady = true;
+  }
+
+  /** Only for « books that open 2+ bonuses » — non-fatal, but said. */
+  async function loadBonus(gameName: string) {
+    try {
+      const b = (await api.bonusStats(gameName)).modes;
+      if (gameName !== loadedGame) return;
+      bonusStats = b;
+      bonusError = null;
+    } catch (e) {
+      if (gameName !== loadedGame) return;
+      bonusStats = [];
+      bonusError = errorText(e);
     }
   }
 
+  async function loadTiers(gameName: string) {
+    try {
+      const t = await api.gameTiers(gameName);
+      if (gameName !== loadedGame) return;
+      tiers = t.modes;
+      ladderSource = t.ladderSource;
+      tiersError = null;
+    } catch (e) {
+      if (gameName !== loadedGame) return;
+      tiers = [];
+      tiersError = errorText(e);
+    }
+  }
+
+  async function loadPops(gameName: string) {
+    try {
+      const p = (await api.populations(gameName, customThresholds)).modes;
+      if (gameName !== loadedGame) return;
+      pops = p;
+      popsError = null;
+    } catch (e) {
+      if (gameName !== loadedGame) return;
+      pops = [];
+      popsError = errorText(e);
+    }
+  }
+
+  /**
+   * Books still importing (first launch, or after a math change): bonuses,
+   * tiers and criteria come from them. Re-read until every mode is in.
+   */
+  $effect(() => {
+    const game = app.selectedGame;
+    if (!game || !pops.length || pops.every((m) => m.imported)) return;
+    const t = setTimeout(() => {
+      if (app.selectedGame === game) void loadPops(game);
+    }, 5000);
+    return () => clearTimeout(t);
+  });
+
   const current = $derived(stats.find((m) => m.mode === selectedMode)?.stats);
-  const currentChecks = $derived(checks?.modes.find((m) => m.mode === selectedMode));
-  const currentBonus = $derived(bonusStats.find((m) => m.mode === selectedMode));
-  const stdPerCost = $derived(current ? current.stdDev / Math.max(1, current.cost) : 0);
+  /** Everything worth a look, over every source SlotLab has for the game. */
+  const issues = $derived(allFindings({ stats, checks, pops, tiers, popsError }));
+  const nBlocking = $derived(issues.filter((i) => i.severity === 'blocking').length);
+  const nSerious = $derived(issues.filter((i) => i.severity === 'serious').length);
+  const nMinor = $derived(issues.filter((i) => i.severity === 'minor').length);
+  const pinnedIds = $derived(new Set(pinned.map(refId)));
 
-  /** Stake-style volatility label (LOW/MEDIUM/HIGH/EXTREME), from std/cost. */
-  function volLabel(std: number): { label: string; cls: string } {
-    if (std >= 32) return { label: 'EXTREME', cls: 'red' };
-    if (std >= 16) return { label: 'HIGH', cls: 'yellow' };
-    if (std >= 6) return { label: 'MEDIUM', cls: 'blue' };
-    return { label: 'LOW', cls: 'green' };
-  }
-
-  function modeCompliance(mode: string): ModeCompliance | undefined {
-    return checks?.modes.find((m) => m.mode === mode);
-  }
-
-  const breakdown = $derived.by(() => {
-    if (!current) return null;
-    const dead = current.zeroRate;
-    const win = current.breakevenRate;
-    const sub = Math.max(0, current.hitRate - win);
-    return { dead, sub, win };
+  const walText = $derived.by(() => {
+    if (!analysisReady) return 'Analysing…';
+    if (nBlocking + nSerious + nMinor === 0) return 'Nothing worth a look';
+    return `${nBlocking ? `${nBlocking} blocking · ` : ''}${nSerious} serious · ${nMinor} minor`;
   });
 
-  function streak1in1000(p: number): number {
-    if (p <= 0 || p >= 1) return 0;
-    return Math.log(0.001) / Math.log(p);
-  }
-  const streaks = $derived.by(() => {
-    if (!current) return null;
+  /** 3★ reached, yet some bet-level constraint misses its 2★ limit (why Compliance shows ✕ under 2★). */
+  const not2Star = $derived(
+    checks && checks.starTier === 3
+      ? checks.betLevelConstraints.filter((c) => !c.pass2star && c.pass3star).map((c) => c.label)
+      : [],
+  );
+
+  /** Books of the selected mode that open the bonus more than once. */
+  const multiTrigger = $derived.by(() => {
+    const b = bonusStats.find((m) => m.mode === selectedMode);
+    const rows = b?.byTriggerCount ?? [];
+    const multi = rows.filter((r) => r.triggers > 1);
+    const total = b?.triggerProbability ?? 0;
+    if (!multi.length || total <= 0) return null;
     return {
-      betweenWin: 1 / Math.max(1e-9, current.hitRate),
-      worstZero: streak1in1000(current.zeroRate),
-      betweenProfit: 1 / Math.max(1e-9, current.breakevenRate),
-      worstLoss: streak1in1000(1 - current.breakevenRate),
+      share: multi.reduce((a, r) => a + r.probability, 0) / total,
+      books: multi.reduce((a, r) => a + r.count, 0),
     };
   });
 
-  function bucketLabel(b: { start: number; end: number }): string {
-    if (b.start === 0 && b.end === 0) return '0';
-    if (b.end > 1e8) return `${b.start}+`;
-    return `${b.start}–${b.end}`;
+  function bonusFreq(mode: string): string | null {
+    const mp = pops.find((m) => m.mode === mode);
+    const b = mp?.populations.find((p) => p.kind === 'bonus');
+    if (b) return oneIn(b.oneIn);
+    return mp?.populations.some((p) => p.kind === 'tier') ? 'every spin' : null;
   }
 
-  /** Buckets that carry RTP (the "0" bucket carries none). */
-  const rtpBuckets = $derived(current ? current.buckets.filter((b) => b.rtpContribution > 0) : []);
+  // ── Navigation ──
+  function select(ref: PopRef) {
+    selectedMode = ref.mode;
+    selectedKey = { ...selectedKey, [ref.mode]: ref.key };
+  }
 
-  /** Horizontal chart: "where the RTP comes from" — single axis, readable. */
-  const distChart = $derived.by(() => {
-    if (!current) return null;
-    return {
-      type: 'bar' as const,
-      data: {
-        labels: rtpBuckets.map(bucketLabel),
-        datasets: [
-          {
-            label: 'RTP contribution',
-            data: rtpBuckets.map((b) => b.rtpContribution * 100),
-            backgroundColor: '#c9a227',
-            borderRadius: 3,
-          },
-        ],
-      },
-      options: {
-        indexAxis: 'y' as const,
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          x: { title: { display: true, text: '% of RTP' }, grid: { color: 'rgba(120,140,128,0.08)' } },
-          y: { grid: { display: false } },
-        },
-      },
-    };
-  });
+  function open(ref: PopRef) {
+    select(ref);
+    view = 'explore';
+  }
+
+  function openTarget(t: Target) {
+    if (t.view === 'explore' && t.mode) {
+      open({ mode: t.mode, key: t.key ?? 'all' });
+      return;
+    }
+    if (t.mode) selectedMode = t.mode;
+    view = t.view;
+  }
+
+  function togglePin(ref: PopRef) {
+    const id = refId(ref);
+    pinned = pinnedIds.has(id) ? pinned.filter((r) => refId(r) !== id) : [...pinned, ref];
+    persist();
+  }
+
+  function pinMany(refs: PopRef[]) {
+    const have = new Set(pinned.map(refId));
+    pinned = [...pinned, ...refs.filter((r) => !have.has(refId(r)))];
+    persist();
+    view = 'compare';
+  }
+
+  function unpin(ref: PopRef) {
+    pinned = pinned.filter((r) => refId(r) !== refId(ref));
+    persist();
+  }
+
+  async function setThresholds(next: number[]) {
+    customThresholds = [...new Set(next)].sort((a, b) => a - b);
+    persist();
+    if (app.selectedGame) await loadPops(app.selectedGame);
+  }
 
   async function playBook(mode: string, simId: number) {
-    if (!app.selectedGame) return;
-    await api.setForce({ game: app.selectedGame, mode, simId });
-    forcedMsg = `${mode} #${simId} forced — next spin in Play`;
-    setTimeout(() => (forcedMsg = null), 4000);
+    const game = app.selectedGame;
+    if (!game) return;
+    await run(() => api.setForce({ game, mode, simId }), {
+      ok: `${mode} #${simId} forced — open Play to spin it`,
+      error: `Could not force ${mode} #${simId}`,
+    });
   }
 
   async function bookmarkBook(mode: string, simId: number, payoutX100: number) {
-    if (!app.selectedGame) return;
-    await bookmarksApi.add({ game: app.selectedGame, mode, simId, payoutX100, description: 'from Analyze' });
-    forcedMsg = `${mode} #${simId} bookmarked`;
-    setTimeout(() => (forcedMsg = null), 3000);
-  }
-
-  function statusPill(status: Check['status']): string {
-    return status === 'pass' ? 'green' : status === 'warn' ? 'yellow' : status === 'fail' ? 'red' : 'blue';
+    const game = app.selectedGame;
+    if (!game) return;
+    const added = await run(
+      () => bookmarksApi.add({ game, mode, simId, payoutX100, description: 'from Analyze' }),
+      { ok: `${mode} #${simId} bookmarked`, error: `Could not bookmark ${mode} #${simId}` },
+    );
+    if (added !== undefined) window.dispatchEvent(new CustomEvent('slotlab:bookmarks-changed'));
   }
 
   const views: { id: View; label: string }[] = [
     { id: 'overview', label: 'Overview' },
+    { id: 'explore', label: 'Explore' },
+    { id: 'mechanics', label: 'Mechanics' },
+    { id: 'compare', label: 'Compare' },
     { id: 'compliance', label: 'Compliance' },
-    { id: 'distribution', label: 'Distribution' },
-    { id: 'bonus', label: 'Bonus' },
-    { id: 'risk', label: 'Risk' },
+    { id: 'tiers', label: 'Win tiers' },
+    { id: 'fleet', label: 'Fleet' },
+    { id: 'market', label: 'Market' },
   ];
+
+  /** Tabs pattern: arrows / Home / End move between the views. */
+  function onTabKey(e: KeyboardEvent) {
+    const i = views.findIndex((v) => v.id === view);
+    const next =
+      e.key === 'ArrowRight' ? (i + 1) % views.length
+      : e.key === 'ArrowLeft' ? (i - 1 + views.length) % views.length
+      : e.key === 'Home' ? 0
+      : e.key === 'End' ? views.length - 1
+      : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    view = views[next].id;
+    document.getElementById(`analyze-tab-${view}`)?.focus();
+  }
 </script>
 
-{#if error}
-  <div class="banner error">{error}</div>
-{:else if !current || !checks}
-  <div class="panel"><p class="dim">Select a loaded game.</p></div>
+{#if !app.selectedGame}
+  <div class="panel empty-state">
+    <p>Select a game to analyse its math.</p>
+    <button class="primary" onclick={() => goTo('games')}>Go to Games</button>
+  </div>
+{:else if error}
+  <div class="banner error" role="alert">
+    <span>Could not read {app.selectedGame}: {error}</span>
+    <button class="ghost" onclick={() => app.selectedGame && load(app.selectedGame)}>Retry</button>
+  </div>
+{:else if loading || !checks}
+  <div class="loading" role="status" aria-live="polite">
+    <p class="dim">Loading statistics for {app.selectedGame}…</p>
+    <div class="skel-bar" aria-hidden="true"></div>
+    <div class="skel-grid" aria-hidden="true">
+      {#each [0, 1, 2, 3] as i (i)}<div class="skel-card"></div>{/each}
+    </div>
+  </div>
+{:else if !current}
+  <div class="panel"><p class="dim">{app.selectedGame} has no mode with statistics.</p></div>
 {:else}
-  {#if forcedMsg}<div class="banner ok">{forcedMsg}</div>{/if}
+  {#if popsError}<div class="banner error">Populations unavailable: {popsError}</div>{/if}
+  {#if bonusError}<div class="banner warn">Bonus analysis unavailable: {bonusError}</div>{/if}
+  {#if tiersError}<div class="banner warn">Win tiers unavailable: {tiersError}</div>{/if}
 
-  <!-- 1. Compact verdict: the "is it OK?" answer at a glance -->
   <header class="verdict-bar">
     <div class="verdict-main">
-      <span class="pill {checks.passed ? 'green' : 'red'} big">
+      <button
+        class="pill {checks.passed ? 'green' : 'red'} big"
+        title="Open Compliance"
+        onclick={() => (view = 'compliance')}
+      >
         {checks.passed ? 'COMPLIANT' : `${checks.failCount} FAIL`}
-      </span>
-      <span class="stars" title="Estimated tier (computable constraints)">
-        {'★'.repeat(checks.starTier)}<span class="stars-off">{'★'.repeat(3 - checks.starTier)}</span>
+      </button>
+      <span
+        class="stars"
+        role="img"
+        aria-label="Estimated tier: {checks.starTier} of 3 stars"
+        title="Estimated tier (computable constraints)"
+      >
+        {'★'.repeat(checks.starTier)}<span class="stars-off">{'☆'.repeat(3 - checks.starTier)}</span>
       </span>
       {#if checks.warnCount > 0}<span class="pill yellow">{checks.warnCount} warn</span>{/if}
+      {#if not2Star.length}
+        <span class="tier-note" title="These constraints pass the 3★ limit but not the 2★ one — see Compliance">
+          not eligible for 2★: {not2Star.join(', ')}
+        </span>
+      {/if}
     </div>
-    <div class="verdict-meta faint">
-      {stats.length} modes · RTP variance {fmtPct(checks.crossModeVariance, 2)}
+    <div class="verdict-meta">
+      <button
+        class="wal"
+        class:pending={!analysisReady}
+        class:bad={nBlocking > 0}
+        class:ok={analysisReady && nBlocking + nSerious + nMinor === 0}
+        aria-label="Show findings: {walText}"
+        onclick={() => (view = 'overview')}
+      >
+        {walText}
+      </button>
+      <span class="faint">{stats.length} modes · RTP variance {fmtPct(checks.crossModeVariance, 2)}</span>
     </div>
   </header>
 
-  <!-- 2. Mode grid: scannable, selects on click -->
-  <div class="mode-grid">
+  <div class="mode-grid" role="group" aria-label="Modes">
     {#each stats as m (m.mode)}
-      {@const mc = modeCompliance(m.mode)}
-      {@const vol = volLabel(m.stats.stdDev / Math.max(1, m.stats.cost))}
+      {@const mc = checks.modes.find((c) => c.mode === m.mode)}
+      {@const bf = bonusFreq(m.mode)}
       <button
         class="mode-card"
         class:active={selectedMode === m.mode}
+        aria-pressed={selectedMode === m.mode}
         onclick={() => (selectedMode = m.mode)}
       >
-        <div class="mc-top">
+        <span class="mc-top">
           <span class="mc-name">{m.mode}</span>
-          <span class="mc-cost">{m.stats.cost}x</span>
+          <span class="mc-cost">{fx(m.stats.cost)}</span>
           {#if mc}
-            <span class="mc-dot {mc.passed === mc.total ? 'ok' : 'bad'}"
-              title="{mc.passed}/{mc.total} checks"></span>
+            <span
+              class="mc-dot {mc.passed === mc.total ? 'ok' : 'bad'}"
+              title="{mc.passed}/{mc.total} checks pass"
+              aria-hidden="true"
+            ></span>
+            <span class="sr-only">{mc.passed} of {mc.total} checks pass</span>
           {/if}
-        </div>
-        <div class="mc-vol"><span class="pill {vol.cls}">{vol.label}</span></div>
-        <div class="mc-stats">
-          <span><i>RTP</i>{fmtPct(m.stats.rtp, 2)}</span>
-          <span><i>Hit</i>{fmtPct(m.stats.hitRate, 1)}</span>
-          <span><i>Max</i>{fmtX(m.stats.maxPayout, 0)}</span>
-        </div>
+        </span>
+        <span class="mc-stats">
+          <span class="mc-stat"><i>RTP</i><b>{fmtPct(m.stats.rtp, 2)}</b></span>
+          <span class="mc-stat"><i>Std÷cost</i><b>{(m.stats.stdDev / Math.max(1, m.stats.cost)).toFixed(1)}</b></span>
+          <span class="mc-stat"><i>Max</i><b>{fmtX(m.stats.maxPayout, 0)}</b></span>
+        </span>
+        <span class="mc-bonus" class:none={!bf}><i>Bonus</i> {bf ?? '—'}</span>
       </button>
     {/each}
   </div>
 
-  <!-- 3. View selector: one lens at a time -->
-  <nav class="view-tabs">
-    {#each views as v (v.id)}
-      <button class:active={view === v.id} onclick={() => (view = v.id)}>{v.label}</button>
-    {/each}
-    <span class="view-context faint">{selectedMode}</span>
-  </nav>
+  <div class="view-tabs">
+    <div class="tablist" role="tablist" aria-label="Analyze views">
+      {#each views as v (v.id)}
+        <button
+          id="analyze-tab-{v.id}"
+          role="tab"
+          aria-selected={view === v.id}
+          aria-controls="analyze-panel"
+          tabindex={view === v.id ? 0 : -1}
+          class:active={view === v.id}
+          onclick={() => (view = v.id)}
+          onkeydown={onTabKey}
+        >
+          {v.label}{#if v.id === 'compare' && pinned.length}<span class="count">{pinned.length}<span class="sr-only"> pinned</span></span>{/if}
+        </button>
+      {/each}
+    </div>
+    <span class="view-context faint">{view === 'compare' || view === 'fleet' || view === 'market' ? '' : selectedMode}</span>
+  </div>
 
-  {#if view === 'overview'}
-    <section class="page">
-      <div class="statline hero">
-        <div><span class="dim">RTP</span><strong class="gold">{fmtPct(current.rtp, 4)}</strong></div>
-        <div><span class="dim">Hit rate</span><strong>{fmtPct(current.hitRate)}</strong></div>
-        <div><span class="dim">Std Dev (÷cost)</span><strong>{stdPerCost.toFixed(2)}</strong></div>
-        <div><span class="dim">Max win</span><strong>{fmtX(current.maxPayout, 0)}</strong></div>
-        <div><span class="dim">Max win HR</span><strong>{fmtOneIn(current.maxPayoutOneIn)}</strong></div>
-        <div><span class="dim">P &lt; bet</span><strong>{fmtPct(1 - current.breakevenRate)}</strong></div>
-      </div>
-
-      {#if breakdown && streaks}
-        <div class="split">
-          <div>
-            <p class="overline">Outcome breakdown</p>
-            <div class="breakdown-bar">
-              <span class="seg dead" style="width: {breakdown.dead * 100}%"></span>
-              <span class="seg subbet" style="width: {breakdown.sub * 100}%"></span>
-              <span class="seg win" style="width: {breakdown.win * 100}%"></span>
-            </div>
-            <div class="breakdown-legend">
-              <span><i class="dot dead"></i> Dead {fmtPct(breakdown.dead)}</span>
-              <span><i class="dot subbet"></i> Sub-bet {fmtPct(breakdown.sub)}</span>
-              <span><i class="dot win"></i> Win {fmtPct(breakdown.win)}</span>
-            </div>
-          </div>
-          <div>
-            <p class="overline">Streaks (1 in 1000)</p>
-            <div class="statline">
-              <div><span class="dim">Between 2 wins</span><strong>{streaks.betweenWin.toFixed(0)}</strong></div>
-              <div><span class="dim">Worst 0 streak</span><strong>{streaks.worstZero.toFixed(0)}</strong></div>
-              <div><span class="dim">Between 2 profits</span><strong>{streaks.betweenProfit.toFixed(0)}</strong></div>
-              <div><span class="dim">Worst loss streak</span><strong>{streaks.worstLoss.toFixed(0)}</strong></div>
-            </div>
-          </div>
-        </div>
-      {/if}
-    </section>
-  {:else if view === 'compliance'}
-    <section class="page">
-      <p class="overline">
-        Compliance per mode — {selectedMode}
-        {#if currentChecks}<span class="faint">({currentChecks.passed}/{currentChecks.total})</span>{/if}
-      </p>
-      {#if currentChecks}
-        <table>
-          <tbody>
-            {#each currentChecks.checks as c (c.id)}
-              <tr>
-                <td>{c.label}</td>
-                <td class="num faint">{c.threshold}</td>
-                <td class="num">{c.value}</td>
-                <td><span class="pill {statusPill(c.status)}">{c.status}</span></td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
-
-      <p class="overline" style="margin-top: 24px;">Overall Bet Level Compliance</p>
-      <table class="tier-table">
-        <thead>
-          <tr>
-            <th>Constraint</th><th class="num">Value</th>
-            <th class="num">2★</th><th></th><th class="num">3★</th><th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each checks.betLevelConstraints as c (c.label)}
-            <tr>
-              <td>{c.label}</td>
-              <td class="num">{c.value}</td>
-              <td class="num faint">{c.limit2star}</td>
-              <td><span class="pill {c.pass2star ? 'green' : 'red'}">{c.pass2star ? '✓' : '✕'}</span></td>
-              <td class="num faint">{c.limit3star}</td>
-              <td><span class="pill {c.pass3star ? 'green' : 'red'}">{c.pass3star ? '✓' : '✕'}</span></td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-      <p class="note">
-        Tail Probability, CVaR and ETL are a proprietary Stake aggregate not
-        replicated by SlotLab — see the <em>Risk</em> tab (indicative) and
-        confirm on the dashboard.
-      </p>
-
-      {#if checks.publishChecks.length > 0}
-        <p class="overline" style="margin-top: 24px;">Publish checks (RGS)</p>
-        <table>
-          <tbody>
-            {#each checks.publishChecks as c (c.id)}
-              <tr>
-                <td>{c.label}</td>
-                <td class="num">{c.value}</td>
-                <td><span class="pill {statusPill(c.status)}">{c.status}</span></td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
-    </section>
-  {:else if view === 'distribution'}
-    <section class="page">
-      <p class="overline">Where the RTP comes from — {selectedMode}</p>
-      <p class="sub">
-        Each bar = the share of the {fmtPct(current.rtp, 2)} RTP contributed by
-        a win band (in bet multiples).
-      </p>
-      {#if distChart}<Chart config={distChart} height={Math.max(220, rtpBuckets.length * 26)} />{/if}
-
-      <p class="overline" style="margin-top: 26px;">All bands</p>
-      <table class="dist-table">
-        <thead>
-          <tr>
-            <th>Band (x bet)</th>
-            <th class="num">Frequency</th>
-            <th class="num">Probability</th>
-            <th class="num">Books</th>
-            <th class="num">RTP</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each current.buckets as b (bucketLabel(b))}
-            <tr>
-              <td>{bucketLabel(b)}</td>
-              <td class="num">{b.start === 0 && b.end === 0 ? '—' : fmtOneIn(b.oneIn)}</td>
-              <td class="num">{fmtPct(b.probability, 3)}</td>
-              <td class="num">{b.count.toLocaleString('en-US')}</td>
-              <td class="num rtp-cell">
-                {fmtPct(b.rtpContribution, 2)}
-                <span class="rtp-track"><span class="rtp-fill" style="width: {b.rtpContribution / current.rtp * 100}%"></span></span>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-
-      <p class="overline" style="margin-top: 26px;">Top payouts</p>
-      <table>
-        <thead>
-          <tr><th class="num">Win</th><th class="num">Frequency</th><th class="num">Books</th><th>Replay an event</th></tr>
-        </thead>
-        <tbody>
-          {#each current.topPayouts as tp (tp.payout)}
-            <tr>
-              <td class="num">{fmtX(tp.payout, 2)}</td>
-              <td class="num">{fmtOneIn(tp.oneIn)}</td>
-              <td class="num">{tp.count}</td>
-              <td>
-                {#each tp.simIds.slice(0, 4) as sid (sid)}
-                  <span class="sim-actions">#{sid}
-                    <button title="Play this book" onclick={() => playBook(selectedMode, sid)}>▶</button>
-                    <button title="Bookmark" onclick={() => bookmarkBook(selectedMode, sid, Math.round(tp.payout * 100))}>★</button>
-                  </span>
-                {/each}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </section>
-  {:else if view === 'bonus'}
-    <section class="page">
-      {#if bonusStats.length === 0}
-        <p class="dim">
-          Bonus stats need the imported books — the import runs
-          automatically (progress shown in Play), then come back here.
-        </p>
-      {:else}
-        {#if currentBonus?.imported}
-          <p class="overline">Bonus trigger — {selectedMode}</p>
-          <div class="statline hero">
-            <div><span class="dim">Trigger chance</span><strong class="gold">{fmtPct(currentBonus.triggerProbability ?? 0, 3)}</strong></div>
-            <div><span class="dim">Frequency</span><strong>{fmtOneIn(currentBonus.triggerOneIn ?? Infinity)}</strong></div>
-            <div><span class="dim">Avg win when triggered</span><strong>{fmtX(currentBonus.avgTriggerWin ?? 0, 1)}</strong></div>
-            <div><span class="dim">Share of RTP</span><strong>{fmtPct(currentBonus.triggerRtpShare ?? 0, 1)}</strong></div>
-            <div><span class="dim">Books with trigger</span><strong>{(currentBonus.booksWithTrigger ?? 0).toLocaleString('en-US')} <span class="faint">/ {(currentBonus.totalBooks ?? 0).toLocaleString('en-US')}</span></strong></div>
-          </div>
-          <p class="sub">
-            Per-spin probabilities weighted by the lookup table — the odds a
-            player actually experiences, unlike the raw book counts shown in
-            Search. “Avg win when triggered” and “Share of RTP” cover the
-            whole book (base win included), in bet multiples.
-          </p>
-        {:else}
-          <p class="overline">Bonus trigger — {selectedMode}</p>
-          <p class="dim">Books not imported for this mode.</p>
-        {/if}
-
-        <p class="overline" style="margin-top: 24px;">All modes compared</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Mode</th>
-              <th class="num">Cost</th>
-              <th class="num">Trigger chance</th>
-              <th class="num">Frequency</th>
-              <th class="num">Avg win</th>
-              <th class="num">RTP share</th>
-              <th class="num">Books w/ trigger</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each bonusStats as b (b.mode)}
-              <tr class:row-active={b.mode === selectedMode}>
-                <td>{b.mode}</td>
-                {#if b.imported}
-                  <td class="num faint">{b.cost}x</td>
-                  <td class="num">{fmtPct(b.triggerProbability ?? 0, 3)}</td>
-                  <td class="num">{fmtOneIn(b.triggerOneIn ?? Infinity)}</td>
-                  <td class="num">{fmtX(b.avgTriggerWin ?? 0, 1)}</td>
-                  <td class="num">{fmtPct(b.triggerRtpShare ?? 0, 1)}</td>
-                  <td class="num faint">{(b.booksWithTrigger ?? 0).toLocaleString('en-US')} / {(b.totalBooks ?? 0).toLocaleString('en-US')}</td>
-                {:else}
-                  <td colspan="6" class="faint">books not imported</td>
-                {/if}
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-
-        {#if currentBonus?.imported}
-          {#if (currentBonus.byTriggerCount?.length ?? 0) > 0}
-            <p class="overline" style="margin-top: 26px;">Triggers per book — {selectedMode}</p>
-            <table>
-              <thead>
-                <tr>
-                  <th>Triggers</th>
-                  <th class="num">Books</th>
-                  <th class="num">Probability</th>
-                  <th class="num">Frequency</th>
-                  <th class="num">Avg win</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each currentBonus.byTriggerCount ?? [] as tc (tc.triggers)}
-                  <tr>
-                    <td>{tc.triggers}×</td>
-                    <td class="num">{tc.count.toLocaleString('en-US')}</td>
-                    <td class="num">{fmtPct(tc.probability, 4)}</td>
-                    <td class="num">{fmtOneIn(tc.oneIn)}</td>
-                    <td class="num">{fmtX(tc.avgWin, 1)}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-            <p class="note">
-              2×+ rows are books where the bonus (re)triggers more than once —
-              a proxy for retrigger odds.
-            </p>
-          {:else}
-            <p class="note" style="margin-top: 20px;">
-              No book in {selectedMode} contains a free-spin trigger event.
-            </p>
-          {/if}
-
-          {#if (currentBonus.byCriteria?.length ?? 0) > 1 || ((currentBonus.byCriteria?.length ?? 0) === 1 && currentBonus.byCriteria?.[0]?.criteria !== '(none)')}
-            <p class="overline" style="margin-top: 26px;">Outcome types — {selectedMode}</p>
-            <table>
-              <thead>
-                <tr>
-                  <th>Criteria</th>
-                  <th class="num">Probability</th>
-                  <th class="num">Frequency</th>
-                  <th class="num">Avg win</th>
-                  <th class="num">RTP contribution</th>
-                  <th class="num">Books (w/ trigger)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each currentBonus.byCriteria ?? [] as c (c.criteria)}
-                  <tr>
-                    <td>{c.criteria}</td>
-                    <td class="num">{fmtPct(c.probability, 3)}</td>
-                    <td class="num">{fmtOneIn(c.oneIn)}</td>
-                    <td class="num">{fmtX(c.avgWin, 1)}</td>
-                    <td class="num">{fmtPct(c.rtpContribution, 2)}</td>
-                    <td class="num faint">{c.count.toLocaleString('en-US')} ({c.booksWithTrigger.toLocaleString('en-US')})</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-            <p class="note">
-              Criteria are the outcome labels written by the math-sdk
-              (e.g. basegame / freegame / wincap) — they tell you WHICH kind
-              of result a spin resolves to, and how likely each one is.
-            </p>
-          {/if}
-        {/if}
-      {/if}
-    </section>
-  {:else if view === 'risk'}
-    <section class="page">
-      <p class="overline">Risk analysis — {selectedMode} <span class="faint">(SlotLab estimate)</span></p>
-      <div class="statline hero">
-        <div><span class="dim">CVaR 0.1%</span><strong>{fmtX(current.cvar001, 0)}</strong></div>
-        <div><span class="dim">ETL 40x</span><strong>{current.etl40x.toFixed(4)}</strong></div>
-        <div><span class="dim">ETL 10kx</span><strong>{current.etl10kx.toFixed(4)}</strong></div>
-        <div><span class="dim">Volatility CV</span><strong>{current.volatility.toFixed(2)}</strong></div>
-      </div>
-      <div class="statline">
-        <div><span class="dim">P(≥5k)</span><strong>{current.probWin5k.toExponential(3)}</strong></div>
-        <div><span class="dim">P(≥10k)</span><strong>{current.probWin10k.toExponential(3)}</strong></div>
-        <div><span class="dim">Mean</span><strong>{fmtX(current.meanPayout, 4)}</strong></div>
-        <div><span class="dim">Median</span><strong>{fmtX(current.medianPayout)}</strong></div>
-        <div><span class="dim">Unique payouts</span><strong>{current.uniquePayoutCount}</strong></div>
-        <div><span class="dim">Most likely</span><strong>{fmtOneIn(current.mostLikelyOneIn)}</strong></div>
-      </div>
-      <p class="note">
-        These tail metrics help compare two math settings, but don't exactly
-        match the aggregated values on the Stake dashboard
-        (game-level Tail/CVaR/ETL). See CrowdSim for the player experience.
-      </p>
-    </section>
-  {/if}
+  <div id="analyze-panel" role="tabpanel" aria-labelledby="analyze-tab-{view}">
+    {#if view === 'overview'}
+      <SessionReach game={app.selectedGame ?? ''} mode={selectedMode} />
+      <Overview {stats} {checks} {pops} {selectedMode} {issues} ready={analysisReady} onSelectMode={(m) => (selectedMode = m)} onTarget={openTarget} />
+    {:else if view === 'explore'}
+      <section class="page">
+        <Explore
+          all={pops}
+          mode={selectedMode}
+          selectedKey={selectedKey[selectedMode] ?? 'all'}
+          pinned={pinnedIds}
+          {multiTrigger}
+          {customThresholds}
+          onSelect={select}
+          onTogglePin={togglePin}
+          onPinMany={pinMany}
+          onPlay={playBook}
+          onBookmark={bookmarkBook}
+          onAddThreshold={(x) => setThresholds([...customThresholds, x])}
+          onRemoveThreshold={(x) => setThresholds(customThresholds.filter((c) => Math.abs(c - x) > 1e-9))}
+        />
+      </section>
+    {:else if view === 'mechanics'}
+      <Mechanics game={app.selectedGame ?? ''} {selectedMode} />
+    {:else if view === 'compare'}
+      <Compare
+        all={pops}
+        {pinned}
+        {customThresholds}
+        onUnpin={unpin}
+        onClear={() => {
+          pinned = [];
+          persist();
+        }}
+        onPinMany={pinMany}
+        onOpen={open}
+      />
+    {:else if view === 'compliance'}
+      <Compliance {checks} {selectedMode} />
+    {:else if view === 'tiers'}
+      <WinTiers game={app.selectedGame ?? ''} {selectedMode} {tiers} {ladderSource} />
+    {:else if view === 'fleet'}
+      <Fleet />
+    {:else if view === 'market'}
+      <section class="page">
+        <Market game={app.selectedGame ?? ''} {selectedMode} />
+      </section>
+    {/if}
+  </div>
 {/if}
 
 <style>
+  .empty-state {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-4);
+    flex-wrap: wrap;
+  }
+
+  .empty-state p {
+    margin: 0;
+    color: var(--text-dim);
+  }
+
+  .banner.error button {
+    margin-left: auto;
+  }
+
+  /* ── Loading placeholder ── */
+  .loading p {
+    margin: 0 0 var(--sp-3);
+    font-size: var(--fs-sm);
+  }
+
+  .skel-bar,
+  .skel-card {
+    border-radius: var(--r-m);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+  }
+
+  .skel-bar {
+    height: 30px;
+    width: min(420px, 100%);
+    margin-bottom: var(--sp-4);
+  }
+
+  .skel-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: var(--sp-2);
+  }
+
+  .skel-card {
+    height: 92px;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .skel-bar,
+    .skel-card {
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+  }
+
+  @keyframes pulse {
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  /* ── Verdict ── */
   .verdict-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 0 16px;
+    flex-wrap: wrap;
+    gap: var(--sp-2) var(--sp-4);
+    padding: var(--sp-1) 0 var(--sp-4);
   }
 
   .verdict-main {
     display: flex;
     align-items: center;
-    gap: 12px;
+    flex-wrap: wrap;
+    gap: var(--sp-3);
   }
 
-  .pill.big {
-    font-size: 12.5px;
-    padding: 3px 12px 3px 10px;
+  .verdict-main button.pill:hover:not(:disabled) {
+    background: color-mix(in oklch, currentColor var(--tint-strong), transparent);
+    border-color: color-mix(in oklch, currentColor 50%, transparent);
   }
 
   .stars {
     color: var(--gold);
-    font-size: 17px;
+    font-size: var(--fs-lg);
     letter-spacing: 2px;
   }
 
   .stars-off {
-    color: var(--border-strong);
+    color: var(--text-faint);
+  }
+
+  .tier-note {
+    font-size: var(--fs-xs);
+    color: var(--text-dim);
   }
 
   .verdict-meta {
-    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    font-size: var(--fs-xs);
   }
 
-  /* Mode grid — scannable cards */
+  .wal {
+    --c: var(--warn);
+    font-size: var(--fs-xs);
+    font-weight: 620;
+    padding: 3px 11px;
+    border-radius: var(--r-pill);
+    color: var(--c);
+    border-color: color-mix(in oklch, var(--c) 35%, transparent);
+    background: color-mix(in oklch, var(--c) var(--tint-weak), transparent);
+  }
+
+  .wal:hover:not(:disabled) {
+    border-color: color-mix(in oklch, var(--c) 60%, transparent);
+    background: color-mix(in oklch, var(--c) var(--tint), transparent);
+  }
+
+  .wal.bad {
+    --c: var(--fail);
+  }
+
+  .wal.ok {
+    --c: var(--pass);
+  }
+
+  .wal.pending {
+    color: var(--text-faint);
+    border-color: var(--border);
+    background: none;
+  }
+
+  /* ── Mode cards ── */
   .mode-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
-    gap: 8px;
-    margin-bottom: 22px;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-6);
   }
 
   .mode-card {
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     gap: 7px;
+    min-width: 0;
     text-align: left;
-    padding: 10px 12px;
+    padding: 10px var(--sp-3);
     border: 1px solid var(--border);
     border-radius: var(--r-m);
     background: var(--bg-panel);
   }
 
-  .mode-card:hover {
+  .mode-card:hover:not(:disabled) {
     border-color: var(--border-strong);
     background: var(--bg-raised);
   }
 
-  .mode-card.active {
+  .mode-card.active,
+  .mode-card.active:hover:not(:disabled) {
     border-color: var(--gold);
-    background: oklch(0.82 0.13 88 / 0.07);
+    background: color-mix(in oklch, var(--gold) var(--tint-weak), transparent);
     box-shadow: inset 3px 0 0 var(--gold);
   }
 
@@ -598,20 +640,27 @@
     display: flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
   }
 
   .mc-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: 680;
-    font-size: 13.5px;
+    font-size: var(--fs-base);
   }
 
   .mc-cost {
+    flex-shrink: 0;
     color: var(--text-faint);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     font-family: var(--font-mono);
   }
 
   .mc-dot {
+    flex-shrink: 0;
     margin-left: auto;
     width: 8px;
     height: 8px;
@@ -621,191 +670,66 @@
   .mc-dot.ok { background: var(--pass); box-shadow: 0 0 6px var(--pass); }
   .mc-dot.bad { background: var(--fail); box-shadow: 0 0 6px var(--fail); }
 
-  .mc-vol .pill {
-    font-size: 9.5px;
-    padding: 0 7px 0 6px;
-  }
-
+  /* Label over value, one column each; never wider than the card. */
   .mc-stats {
-    display: flex;
-    justify-content: space-between;
-    gap: 4px;
-  }
-
-  .mc-stats span {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .mc-stats i {
-    font-style: normal;
-    font-family: var(--font-body);
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
-  }
-
-  /* View selector */
-  .view-tabs {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 20px;
-  }
-
-  .view-tabs button {
-    border: none;
-    border-radius: 0;
-    background: transparent;
-    color: var(--text-dim);
-    padding: 8px 16px;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-  }
-
-  .view-tabs button:hover {
-    color: var(--text);
-    background: transparent;
-  }
-
-  .view-tabs button.active {
-    color: var(--gold);
-    border-bottom-color: var(--gold);
-    font-weight: 640;
-  }
-
-  .view-context {
-    margin-left: auto;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    font-family: var(--font-mono);
-  }
-
-  .statline.hero {
-    padding: 4px 0 18px;
-  }
-
-  .statline.hero strong {
-    font-size: 20px;
-  }
-
-  .statline.hero .gold {
-    color: var(--gold);
-  }
-
-  .split {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 40px;
-    align-items: start;
-    padding-top: 6px;
+    grid-template-columns: repeat(3, minmax(0, auto));
+    justify-content: space-between;
+    column-gap: 6px;
+    row-gap: 6px;
   }
 
-  @media (max-width: 1000px) {
-    .split {
-      grid-template-columns: 1fr;
-      gap: 24px;
+  /* Very narrow card: RTP | Std on a row, Max under. */
+  @container (max-width: 150px) {
+    .mc-stats {
+      grid-template-columns: repeat(2, minmax(0, auto));
     }
   }
 
-  .sub {
-    font-size: 12px;
-    color: var(--text-dim);
-    margin: -4px 0 14px;
-    max-width: 620px;
-  }
-
-  /* Inline RTP bar in the distribution table */
-  .rtp-cell {
-    position: relative;
-    min-width: 120px;
-  }
-
-  .rtp-track {
-    display: block;
-    height: 3px;
-    margin-top: 3px;
-    background: oklch(0.26 0.015 165);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .rtp-fill {
-    display: block;
-    height: 100%;
-    background: var(--gold);
-    border-radius: 2px;
-  }
-
-  .dist-table td {
-    vertical-align: middle;
-  }
-
-  .breakdown-bar {
+  .mc-stat {
     display: flex;
-    height: 22px;
-    border-radius: 5px;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .mc-stat b {
     overflow: hidden;
-    border: 1px solid var(--border);
-  }
-
-  .seg.dead { background: oklch(0.4 0.02 165); }
-  .seg.subbet { background: var(--warn); }
-  .seg.win { background: var(--pass); }
-
-  .breakdown-legend {
-    display: flex;
-    gap: 18px;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--text-dim);
-  }
-
-  .dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 2px;
-    margin-right: 4px;
-  }
-
-  .dot.dead { background: oklch(0.4 0.02 165); }
-  .dot.subbet { background: var(--warn); }
-  .dot.win { background: var(--pass); }
-
-  .tier-table td:first-child { color: var(--text); }
-
-  .row-active td:first-child {
-    color: var(--gold);
-    font-weight: 640;
-  }
-
-  .note {
-    font-size: 11.5px;
-    color: var(--text-faint);
-    max-width: 780px;
-    margin: 12px 0 0;
-    line-height: 1.55;
-  }
-
-  .sim-actions {
-    display: inline-flex;
-    gap: 2px;
-    align-items: center;
-    margin-right: 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--fs-xs);
+    font-variant-numeric: tabular-nums;
   }
 
-  .sim-actions button {
-    padding: 0 5px;
-    font-size: 10px;
+  .mc-stats i,
+  .mc-bonus i {
+    font-style: normal;
+    font-family: var(--font-body);
+    font-size: var(--fs-2xs);
+    white-space: nowrap;
+    color: var(--text-faint);
+  }
+
+  .mc-bonus {
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .mc-bonus.none {
+    color: var(--text-faint);
+  }
+
+  /* ── Sub-view tabs (the strip is global; the tablist sits inside it) ── */
+  .tablist {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-wrap: wrap;
   }
 </style>

@@ -46,9 +46,8 @@ pub fn ensure_material() -> Result<TlsMaterial> {
         (cert, key)
     };
 
-    let leaf_ok = leaf_cert_path.exists()
-        && leaf_key_path.exists()
-        && leaf_not_expiring(&leaf_cert_path);
+    let leaf_ok =
+        leaf_cert_path.exists() && leaf_key_path.exists() && leaf_not_expiring(&leaf_cert_path);
     let (leaf_cert_pem, leaf_key_pem) = if leaf_ok {
         (
             std::fs::read_to_string(&leaf_cert_path)?,
@@ -62,14 +61,15 @@ pub fn ensure_material() -> Result<TlsMaterial> {
         (cert, key)
     };
 
-    Ok(TlsMaterial { ca_pem, leaf_cert_pem, leaf_key_pem })
+    Ok(TlsMaterial {
+        ca_pem,
+        leaf_cert_pem,
+        leaf_key_pem,
+    })
 }
 
 fn generate_ca() -> Result<(String, String)> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair,
-        KeyUsagePurpose,
-    };
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params
@@ -78,8 +78,7 @@ fn generate_ca() -> Result<(String, String)> {
     params
         .distinguished_name
         .push(DnType::OrganizationName, "SlotLab");
-    params.key_usages =
-        vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(365 * 10);
@@ -89,12 +88,9 @@ fn generate_ca() -> Result<(String, String)> {
 }
 
 fn generate_leaf(ca_pem: &str, ca_key_pem: &str) -> Result<(String, String)> {
-    use rcgen::{
-        CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, SanType,
-    };
+    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, SanType};
     let ca_key = KeyPair::from_pem(ca_key_pem).context("CA key")?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_pem)
-        .context("CA params from PEM")?;
+    let ca_params = CertificateParams::from_ca_cert_pem(ca_pem).context("CA params from PEM")?;
     let ca = ca_params.self_signed(&ca_key).context("reload CA")?;
 
     let mut params = CertificateParams::default();

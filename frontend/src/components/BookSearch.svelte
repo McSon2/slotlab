@@ -1,5 +1,7 @@
 <script lang="ts">
   import { bookmarksApi, fmtOneIn, fmtX } from '../lib/api';
+  import { errorText, notify, run } from '../lib/stores.svelte';
+  import Icon from './Icon.svelte';
 
   interface SearchModeMeta {
     mode: string;
@@ -13,7 +15,10 @@
     simId: number;
     payoutX100: number;
     criteria: string | null;
+    /** Événements `freeSpinTrigger` du book. */
     fsTriggers: number;
+    /** Retriggers dans le bonus : annonces d'un total de free spins plus haut. */
+    fsRetriggers: number;
     oneIn: number | null;
   }
 
@@ -26,17 +31,23 @@
   } = $props();
 
   let meta = $state<SearchModeMeta[]>([]);
+  let metaError = $state<string | null>(null);
   let mode = $state('');
   let payoutMin = $state('');
   let payoutMax = $state('');
   let criteria = $state('');
   let eventType = $state('');
-  let minFs = $state('');
+  let bonus = $state<'any' | 'without' | 'with'>('any');
+  let sort = $state<'payoutDesc' | 'payoutAsc' | 'id'>('payoutDesc');
+  let minRetriggers = $state('');
   let hits = $state<SearchHit[]>([]);
   let total = $state(0);
   let offset = $state(0);
   let busy = $state(false);
-  let msg = $state<string | null>(null);
+  /** Modes the last search skipped (books not imported yet). */
+  let notImported = $state<string[]>([]);
+  /** Row whose bookmark request is in flight. */
+  let bookmarking = $state<string | null>(null);
   const limit = 50;
 
   $effect(() => {
@@ -44,13 +55,20 @@
   });
 
   async function loadMeta(gameName: string) {
-    const r = await fetch(
-      `/api/ui/games/${encodeURIComponent(gameName)}/search-meta`,
-    ).then((r) => r.json());
-    meta = r.modes ?? [];
     hits = [];
     total = 0;
-    msg = null;
+    notImported = [];
+    try {
+      const res = await fetch(`/api/ui/games/${encodeURIComponent(gameName)}/search-meta`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const r = await res.json();
+      if (gameName !== game) return; // game changed meanwhile
+      meta = r.modes ?? [];
+      metaError = null;
+    } catch (e) {
+      meta = [];
+      metaError = errorText(e);
+    }
   }
 
   const currentMeta = $derived(meta.find((m) => m.mode === mode));
@@ -63,11 +81,10 @@
       : [...new Set(meta.flatMap((m) => m.eventTypes ?? []))],
   );
 
-  async function run(newOffset = 0) {
+  async function search(newOffset = 0) {
     busy = true;
-    msg = null;
     try {
-      const r = await fetch('/api/ui/search', {
+      const res = await fetch('/api/ui/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -77,46 +94,69 @@
           payoutMax: payoutMax ? Number(payoutMax) : undefined,
           criteria: criteria || undefined,
           eventTypes: eventType ? [eventType] : [],
-          minFsTriggers: minFs ? Number(minFs) : undefined,
+          bonus,
+          sort,
+          // Retriggers DANS le bonus (`fsRetriggers`), pas le nombre de
+          // `freeSpinTrigger` : celui-ci vaut 1 pour tout book de bonus de
+          // BLOOD WATER, quels que soient ses retriggers.
+          minRetriggers: minRetriggers ? Number(minRetriggers) : undefined,
           offset: newOffset,
           limit,
         }),
-      }).then((r) => r.json());
+      });
+      const r = await res.json().catch(() => ({}));
       if (r.error) throw new Error(r.error);
-      hits = r.hits;
-      total = r.total;
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      hits = r.hits ?? [];
+      total = r.total ?? 0;
       offset = newOffset;
-      if (r.notImported?.length) {
-        msg = `Modes not imported (ignored): ${r.notImported.join(', ')}`;
-      }
+      notImported = r.notImported ?? [];
+      if (hits.length === 0) notify('No book matches these filters', 'info');
     } catch (e) {
-      msg = e instanceof Error ? e.message : String(e);
+      notify(`Search failed: ${errorText(e)}`, 'error');
     } finally {
       busy = false;
     }
   }
 
-  function playBook(hit: SearchHit) {
-    onPlay(hit.mode, hit.simId);
-    msg = `${hit.mode} #${hit.simId} forced — next spin plays this book`;
-  }
-
   async function bookmark(hit: SearchHit) {
-    await bookmarksApi.add({
-      game,
-      mode: hit.mode,
-      simId: hit.simId,
-      payoutX100: hit.payoutX100,
-      description: 'from Search',
-    });
-    msg = `${hit.mode} #${hit.simId} bookmarked`;
+    bookmarking = hit.mode + hit.simId;
+    const ok = await run(
+      () =>
+        bookmarksApi.add({
+          game,
+          mode: hit.mode,
+          simId: hit.simId,
+          payoutX100: hit.payoutX100,
+          description: 'from Search',
+        }),
+      { ok: `Bookmarked ${hit.mode} #${hit.simId}`, error: 'Could not add the bookmark' },
+    );
+    bookmarking = null;
+    if (ok !== undefined) {
+      window.dispatchEvent(new CustomEvent('slotlab:bookmarks-changed', { detail: { game } }));
+    }
   }
 </script>
 
 <details class="panel search-books">
-  <summary>⌕ Search books — find an event by win, criteria or bonus, then force it</summary>
+  <summary>
+    <Icon name="scan" size={13} />
+    Search books — find an event by win, criteria or bonus, then force it
+  </summary>
 
-  <div class="controls">
+  {#if metaError}
+    <p class="field-error" role="alert">Could not load the search filters: {metaError}</p>
+  {/if}
+
+  <form
+    class="controls"
+    aria-label="Search books"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void search(0);
+    }}
+  >
     <label>
       <span>Mode</span>
       <select bind:value={mode}>
@@ -126,11 +166,11 @@
     </label>
     <label>
       <span>Min win (x)</span>
-      <input style="width: 80px" bind:value={payoutMin} placeholder="100" />
+      <input style="width: 80px" bind:value={payoutMin} placeholder="e.g. 100" inputmode="decimal" />
     </label>
     <label>
       <span>Max win (x)</span>
-      <input style="width: 80px" bind:value={payoutMax} placeholder="5000" />
+      <input style="width: 80px" bind:value={payoutMax} placeholder="e.g. 5000" inputmode="decimal" />
     </label>
     <label>
       <span>Criteria</span>
@@ -140,32 +180,60 @@
       </select>
     </label>
     <label>
+      <span>Bonus</span>
+      <select bind:value={bonus}>
+        <option value="any">any</option>
+        <option value="without">without bonus</option>
+        <option value="with">with bonus</option>
+      </select>
+    </label>
+    <label>
+      <span>Sort</span>
+      <select bind:value={sort}>
+        <option value="payoutDesc">win ↓</option>
+        <option value="payoutAsc">win ↑</option>
+        <option value="id">book id</option>
+      </select>
+    </label>
+    <label>
       <span>Event present</span>
       <select bind:value={eventType}>
         <option value="">—</option>
         {#each allEventTypes as t (t)}<option>{t}</option>{/each}
       </select>
     </label>
-    <label>
+    <label
+      title="Re-triggers inside the bonus: every announcement of a free-spin total above all the previous ones (freeSpinRetrigger, updateFreeSpin, sharkFeed.hunts…)"
+    >
       <span>Retriggers ≥</span>
-      <input style="width: 56px" bind:value={minFs} placeholder="2" />
+      <input style="width: 64px" bind:value={minRetriggers} placeholder="e.g. 2" inputmode="numeric" />
     </label>
-    <button class="primary" onclick={() => run(0)} disabled={busy}>
+    <button type="submit" class="primary" disabled={busy}>
       {busy ? 'Searching…' : 'Search'}
     </button>
-  </div>
+  </form>
 
-  {#if msg}
-    <div class="toast">{msg}</div>
+  {#if notImported.length > 0}
+    <p class="note">Modes not imported yet (ignored): {notImported.join(', ')}</p>
   {/if}
 
   {#if hits.length > 0}
     <div class="results-head">
       <h3>{total.toLocaleString('en-US')} results</h3>
-      <div>
-        <button disabled={offset === 0} onclick={() => run(Math.max(0, offset - limit))}>←</button>
-        <span class="dim">{offset + 1}–{Math.min(offset + limit, total)}</span>
-        <button disabled={offset + limit >= total} onclick={() => run(offset + limit)}>→</button>
+      <div class="pager">
+        <button
+          disabled={busy || offset === 0}
+          aria-label="Previous page"
+          title="Previous page"
+          onclick={() => search(Math.max(0, offset - limit))}
+        ><Icon name="chevron-left" size={14} /></button>
+        <span class="dim num">{offset + 1}–{Math.min(offset + limit, total)}</span>
+        <button
+          disabled={busy || offset + limit >= total}
+          aria-label="Next page"
+          title="Next page"
+          onclick={() => search(offset + limit)}
+        ><Icon name="chevron-right" size={14} /></button>
       </div>
     </div>
     <table>
@@ -177,7 +245,8 @@
           <th class="num">Frequency</th>
           <th>Criteria</th>
           <th class="num">FS triggers</th>
-          <th></th>
+          <th class="num">Retriggers</th>
+          <th><span class="sr-only">Actions</span></th>
         </tr>
       </thead>
       <tbody>
@@ -189,9 +258,20 @@
             <td class="num">{h.oneIn ? fmtOneIn(h.oneIn) : '—'}</td>
             <td class="dim">{h.criteria ?? '—'}</td>
             <td class="num">{h.fsTriggers || '—'}</td>
+            <!-- 0 sur un book de bonus (pas de retrigger), « — » sans bonus. -->
+            <td class="num">{h.fsTriggers || h.fsRetriggers ? h.fsRetriggers : '—'}</td>
             <td class="actions">
-              <button onclick={() => playBook(h)}>▶ Play</button>
-              <button onclick={() => bookmark(h)}>★</button>
+              <button
+                title="Force on next spin"
+                aria-label="Force {h.mode} #{h.simId} on the next spin"
+                onclick={() => onPlay(h.mode, h.simId)}
+              ><Icon name="play" size={10} /> Play</button>
+              <button
+                title="Bookmark this event"
+                aria-label="Bookmark {h.mode} #{h.simId}"
+                disabled={bookmarking === h.mode + h.simId}
+                onclick={() => bookmark(h)}
+              ><Icon name="star" size={13} /></button>
             </td>
           </tr>
         {/each}
@@ -202,11 +282,11 @@
 
 <style>
   .search-books {
-    margin-bottom: 16px;
+    margin-bottom: var(--sp-4);
   }
 
   .search-books summary {
-    font-size: 12.5px;
+    font-size: var(--fs-sm);
     color: var(--text-dim);
     cursor: pointer;
     user-select: none;
@@ -217,7 +297,7 @@
   }
 
   .search-books[open] summary {
-    margin-bottom: 12px;
+    margin-bottom: var(--sp-3);
   }
 
   .controls {
@@ -226,7 +306,7 @@
     flex-wrap: wrap;
     gap: 10px 14px;
     align-items: flex-end;
-    margin-bottom: 12px;
+    margin: 0 0 var(--sp-3);
   }
 
   /* Same alignment system as the Play strip: one height, bottoms flush. */
@@ -242,7 +322,7 @@
   }
 
   .controls label > span {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     line-height: 1;
     text-transform: uppercase;
     letter-spacing: 0.1em;
@@ -250,17 +330,23 @@
     white-space: nowrap;
   }
 
-  .toast {
-    color: var(--green);
-    font-size: 12.5px;
-    margin-bottom: 10px;
+  .note {
+    color: var(--text-faint);
+    font-size: var(--fs-xs);
+    margin: 0 0 var(--sp-2);
   }
 
   .results-head {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 8px;
+    margin-bottom: var(--sp-2);
+  }
+
+  .pager {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
   }
 
   .actions {
@@ -269,7 +355,11 @@
   }
 
   .actions button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     padding: 2px 8px;
-    font-size: 12px;
+    min-height: 24px;
+    font-size: var(--fs-sm);
   }
 </style>

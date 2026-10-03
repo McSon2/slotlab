@@ -1,14 +1,30 @@
 use crate::persist::{self, Config, GameEntry};
 use anyhow::{bail, Context, Result};
 use slotlab_core::model::{GameIndex, Lut, ModeConfig};
+use slotlab_core::stats::ModeStats;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// A loaded mode: its config + its LUT (with prefix-sums ready for drawing).
 pub struct LoadedMode {
     pub config: ModeConfig,
     pub lut: Arc<Lut>,
+    /// `stats::analyze` of `lut`, computed on first use. The LUT never changes
+    /// in place (a reload builds a new `LoadedMode`), so it is computed once
+    /// instead of on every games list, stats, checks and bonus request.
+    stats: OnceLock<ModeStats>,
+}
+
+impl LoadedMode {
+    pub fn new(config: ModeConfig, lut: Arc<Lut>) -> Self {
+        Self { config, lut, stats: OnceLock::new() }
+    }
+
+    pub fn stats(&self) -> &ModeStats {
+        self.stats
+            .get_or_init(|| slotlab_core::stats::analyze(&self.lut, self.config.cost))
+    }
 }
 
 pub struct LoadedGame {
@@ -20,6 +36,21 @@ pub struct LoadedGame {
 }
 
 impl LoadedGame {
+    /// `<repo>/frontend` — the monorepo root holding `apps/` and `packages/`,
+    /// which is what the source-level checks grep.
+    pub fn frontend_root(&self) -> Option<std::path::PathBuf> {
+        let app = self.entry.app_dir.as_ref()?;
+        Some(app.parent()?.parent()?.to_path_buf())
+    }
+
+    /// The cheapest mode — the base game, in the sense every ladder and every
+    /// cross-mode check uses.
+    pub fn base_mode(&self) -> Option<&LoadedMode> {
+        self.modes
+            .iter()
+            .min_by(|a, b| a.config.cost.total_cmp(&b.config.cost))
+    }
+
     pub fn resolve_mode(&self, name: &str) -> Option<&LoadedMode> {
         self.modes.iter().find(|m| {
             m.config.name.eq_ignore_ascii_case(name)
@@ -46,9 +77,12 @@ impl Registry {
         let mut migrated = false;
         for entry in &mut config.games {
             if entry.build_dir.is_none() {
-                entry.build_dir =
-                    detect_build_dir(&entry.publish_dir, &entry.name);
+                entry.build_dir = detect_build_dir(&entry.publish_dir, &entry.name);
                 migrated |= entry.build_dir.is_some();
+            }
+            if entry.app_dir.is_none() {
+                entry.app_dir = detect_app_dir(&entry.publish_dir, &entry.name);
+                migrated |= entry.app_dir.is_some();
             }
         }
         if migrated {
@@ -59,15 +93,49 @@ impl Registry {
         for entry in &config.games {
             match load_game(entry.clone()) {
                 Ok(g) => {
+                    // A build never seen before is written down here, so the
+                    // next load can say what a `run.py prod` changed.
+                    crate::history::record(&g);
                     games.insert(entry.name.clone(), Arc::new(g));
                 }
                 Err(e) => errors.push((entry.name.clone(), format!("{e:#}"))),
             }
         }
         (
-            Self { games: RwLock::new(games), config: Mutex::new(config) },
+            Self {
+                games: RwLock::new(games),
+                config: Mutex::new(config),
+            },
             errors,
         )
+    }
+
+    /// Empty registry, not backed by the persisted config: used by the hub,
+    /// which has neither a UI nor a game picker and rediscovers its games
+    /// from disk on every reload.
+    pub fn empty() -> Self {
+        Self {
+            games: RwLock::new(HashMap::new()),
+            config: Mutex::new(Config::default()),
+        }
+    }
+
+    /// Replaces the whole set of loaded games in one shot. Returns the
+    /// entries that failed to load, by name. Games already served keep
+    /// working until the swap: handlers hold an Arc on their own copy.
+    pub fn load_all(&self, entries: Vec<GameEntry>) -> Vec<(String, String)> {
+        let mut games = HashMap::new();
+        let mut errors = Vec::new();
+        for entry in entries {
+            match load_game(entry.clone()) {
+                Ok(g) => {
+                    games.insert(entry.name.clone(), Arc::new(g));
+                }
+                Err(e) => errors.push((entry.name.clone(), format!("{e:#}"))),
+            }
+        }
+        *self.games.write().unwrap() = games;
+        errors
     }
 
     pub fn list_entries(&self) -> Vec<GameEntry> {
@@ -85,7 +153,11 @@ impl Registry {
         if entry.build_dir.is_none() {
             entry.build_dir = detect_build_dir(&entry.publish_dir, &entry.name);
         }
+        if entry.app_dir.is_none() {
+            entry.app_dir = detect_app_dir(&entry.publish_dir, &entry.name);
+        }
         let game = Arc::new(load_game(entry.clone())?);
+        crate::history::record(&game);
         self.games
             .write()
             .unwrap()
@@ -122,17 +194,27 @@ impl Registry {
             .find(|g| g.name == name)
             .cloned()
             .context("unknown game")?;
+        // A build (or an app folder) that appeared since the last load: the
+        // detection is retried on every reload, and persisted when it lands.
+        let mut found = false;
         if entry.build_dir.is_none() {
             entry.build_dir = detect_build_dir(&entry.publish_dir, &entry.name);
-            if entry.build_dir.is_some() {
-                let mut cfg = self.config.lock().unwrap();
-                if let Some(g) = cfg.games.iter_mut().find(|g| g.name == name) {
-                    g.build_dir = entry.build_dir.clone();
-                }
-                let _ = persist::save_config(&cfg);
+            found |= entry.build_dir.is_some();
+        }
+        if entry.app_dir.is_none() {
+            entry.app_dir = detect_app_dir(&entry.publish_dir, &entry.name);
+            found |= entry.app_dir.is_some();
+        }
+        if found {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(g) = cfg.games.iter_mut().find(|g| g.name == name) {
+                g.build_dir = entry.build_dir.clone();
+                g.app_dir = entry.app_dir.clone();
             }
+            let _ = persist::save_config(&cfg);
         }
         let game = Arc::new(load_game(entry)?);
+        crate::history::record(&game);
         self.games
             .write()
             .unwrap()
@@ -215,6 +297,7 @@ impl Registry {
                         .map(|m| LoadedMode {
                             config: m.config.clone(),
                             lut: m.lut.clone(),
+                            stats: m.stats.clone(),
                         })
                         .collect(),
                     fingerprint: g.fingerprint,
@@ -226,31 +309,59 @@ impl Registry {
 }
 
 /// Fingerprint of a file: size + mtime + xxh3 of the first/last MiB.
+///
+/// Memoized per (path, size, mtime): the games list and the import poll ask
+/// for it every few seconds, and each fresh computation reads 2 MiB. A file
+/// rewritten with the same size AND the same nanosecond mtime is the only
+/// change this misses — the hash itself could not tell either apart better.
 pub fn fingerprint_file(path: &Path) -> u64 {
     use std::io::{Read, Seek, SeekFrom};
     use xxhash_rust::xxh3::Xxh3;
+    type Key = (std::path::PathBuf, u64, u128);
+    static MEMO: OnceLock<Mutex<HashMap<Key, u64>>> = OnceLock::new();
+
     let mut h = Xxh3::new();
-    if let Ok(meta) = std::fs::metadata(path) {
-        h.update(&meta.len().to_le_bytes());
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                h.update(&d.as_nanos().to_le_bytes());
-            }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return h.digest();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    let key = mtime.map(|t| (path.to_path_buf(), meta.len(), t));
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(k) = &key {
+        if let Some(&fp) = memo.lock().unwrap().get(k) {
+            return fp;
         }
-        if let Ok(mut f) = std::fs::File::open(path) {
-            let mut buf = vec![0u8; 1024 * 1024];
+    }
+
+    h.update(&meta.len().to_le_bytes());
+    if let Some(t) = mtime {
+        h.update(&t.to_le_bytes());
+    }
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let mut buf = vec![0u8; 1024 * 1024];
+        if let Ok(n) = f.read(&mut buf) {
+            h.update(&buf[..n]);
+        }
+        if meta.len() > 2 * 1024 * 1024 {
+            let _ = f.seek(SeekFrom::End(-(1024 * 1024)));
             if let Ok(n) = f.read(&mut buf) {
                 h.update(&buf[..n]);
             }
-            if meta.len() > 2 * 1024 * 1024 {
-                let _ = f.seek(SeekFrom::End(-(1024 * 1024)));
-                if let Ok(n) = f.read(&mut buf) {
-                    h.update(&buf[..n]);
-                }
-            }
         }
     }
-    h.digest()
+    let fp = h.digest();
+    if let Some(k) = key {
+        let mut memo = memo.lock().unwrap();
+        if memo.len() >= 4096 {
+            memo.clear();
+        }
+        memo.insert(k, fp);
+    }
+    fp
 }
 
 /// Guesses the frontend static build from publish_dir:
@@ -277,6 +388,29 @@ pub fn detect_build_dir(publish_dir: &Path, game_name: &str) -> Option<std::path
     None
 }
 
+/// The game's frontend app folder: `<repo>/frontend/apps/<name>`, or the
+/// single app of the monorepo when the folder is not named after the game
+/// (`fortune_neko` ships `apps/maneki-888`).
+pub fn detect_app_dir(publish_dir: &Path, game_name: &str) -> Option<std::path::PathBuf> {
+    let s = publish_dir.to_string_lossy();
+    let root = s.split("/math/games/").next()?;
+    let apps = Path::new(root).join("frontend/apps");
+    let named = apps.join(game_name);
+    if named.join("package.json").is_file() {
+        return Some(named);
+    }
+    let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(&apps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("package.json").is_file())
+        .collect();
+    if candidates.len() == 1 {
+        return candidates.pop();
+    }
+    None
+}
+
 fn load_game(entry: GameEntry) -> Result<LoadedGame> {
     let dir = &entry.publish_dir;
     if !dir.is_dir() {
@@ -284,8 +418,7 @@ fn load_game(entry: GameEntry) -> Result<LoadedGame> {
     }
     let index_bytes = std::fs::read(dir.join("index.json"))
         .with_context(|| format!("reading {}/index.json", dir.display()))?;
-    let index = slotlab_core::index_json::parse(&index_bytes)
-        .context("parse index.json")?;
+    let index = slotlab_core::index_json::parse(&index_bytes).context("parse index.json")?;
 
     use xxhash_rust::xxh3::Xxh3;
     let mut fp = Xxh3::new();
@@ -300,7 +433,12 @@ fn load_game(entry: GameEntry) -> Result<LoadedGame> {
             .with_context(|| format!("parse LUT {}", mode.weights))?;
         fp.update(&fingerprint_file(&lut_path).to_le_bytes());
         fp.update(&fingerprint_file(&dir.join(&mode.events)).to_le_bytes());
-        modes.push(LoadedMode { config: mode.clone(), lut: Arc::new(lut) });
+        modes.push(LoadedMode::new(mode.clone(), Arc::new(lut)));
     }
-    Ok(LoadedGame { entry, index, modes, fingerprint: fp.digest() })
+    Ok(LoadedGame {
+        entry,
+        index,
+        modes,
+        fingerprint: fp.digest(),
+    })
 }
