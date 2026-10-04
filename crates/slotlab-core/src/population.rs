@@ -276,22 +276,12 @@ pub fn analyze(
     ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
 
     let ctx = Ctx { total_w, mode_value, mode_max_x100, bonus_w, cost, thresholds: ts, cdf: cdf_grid() };
-    // Criteria de TRANCHE `<source>__<suffixe>` (échantillonnage ciblé d'une tranche de gain,
-    // même mécanique que la source) : rangés sous leur source, sinon chaque tranche ciblée se
-    // lirait comme une variante du bonus (Toxic Spins : 15 lignes « 4 scatters · freegame_4__tN »).
-    let family_name = |n: &str| n.split("__").next().unwrap_or(n).to_string();
-    let fam_idx: Vec<usize> = criteria_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let f = family_name(n);
-            criteria_names.iter().position(|m| family_name(m) == f).unwrap_or(i)
-        })
-        .collect();
-    let fam = |c: Option<usize>| c.map(|i| fam_idx.get(i).copied().unwrap_or(i));
-    let crit_name = |c: Option<usize>| {
-        c.and_then(|i| criteria_names.get(i).map(|n| family_name(n)))
-            .unwrap_or_else(|| "(none)".to_string())
+    // Familles (`crate::family`) : un bonus se lit par son palier, un spin sans bonus par la
+    // famille de son criteria — jamais par seau de simulation (2026-10-04).
+    let fam_of = |b: &BookFacts| {
+        crate::family::criteria_family(
+            b.criteria.and_then(|i| criteria_names.get(i)).map_or("(none)", |n| n.as_str()),
+        )
     };
     let tier_label = |t: u8| {
         if t == 0 {
@@ -321,53 +311,36 @@ pub fn analyze(
         ));
     }
 
-    // Paliers croissants, « untiered » en dernier ; criteria par poids décroissant.
-    let mut tiers: BTreeMap<(bool, u8), BTreeMap<Option<usize>, u64>> = BTreeMap::new();
-    let mut crits: BTreeMap<Option<usize>, u64> = BTreeMap::new();
+    // Paliers croissants, « untiered » en dernier ; familles hors bonus par poids décroissant.
+    let mut tiers: BTreeMap<(bool, u8), u64> = BTreeMap::new();
+    let mut fams: BTreeMap<String, u64> = BTreeMap::new();
     for b in books {
         if b.bonus {
-            *tiers.entry((b.tier == 0, b.tier)).or_default().entry(fam(b.criteria)).or_default() +=
-                b.weight;
+            *tiers.entry((b.tier == 0, b.tier)).or_default() += b.weight;
+        } else {
+            *fams.entry(fam_of(b)).or_default() += b.weight;
         }
-        *crits.entry(fam(b.criteria)).or_default() += b.weight;
     }
     let bonus_parent = if any_nobonus { "bonus" } else { "all" };
-    for (&(_, tier), by_crit) in &tiers {
+    for &(_, tier) in tiers.keys() {
         let key = tier_key(tier);
         push(ctx.population(
             books.iter().filter(|b| b.bonus && b.tier == tier),
             Meta::new(&key, "tier", &tier_label(tier)).parent(bonus_parent).tier(tier),
         ));
-        let mut variants: Vec<(Option<usize>, u64)> =
-            by_crit.iter().filter(|(_, w)| **w > 0).map(|(c, w)| (*c, *w)).collect();
-        if variants.len() < 2 {
-            continue;
-        }
-        variants.sort_by(|a, b| b.1.cmp(&a.1));
-        for (c, _) in variants {
-            let name = crit_name(c);
+    }
+    let mut fam_rows: Vec<(String, u64)> = fams.into_iter().filter(|(_, w)| *w > 0).collect();
+    fam_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    // Une seule famille qui couvre tous les spins sans bonus : rien à détailler.
+    if fam_rows.len() > 1 || !any_nobonus {
+        for (name, _) in fam_rows {
             push(ctx.population(
-                books.iter().filter(|b| b.bonus && b.tier == tier && fam(b.criteria) == c),
-                Meta::new(
-                    &format!("{key}/crit:{name}"),
-                    "variant",
-                    &format!("{} · {name}", tier_label(tier)),
-                )
-                .parent(&key)
-                .tier(tier)
-                .criteria(&name),
+                books.iter().filter(|b| !b.bonus && fam_of(b) == name),
+                Meta::new(&format!("crit:{name}"), "criteria", &name)
+                    .parent(if any_nobonus && bonus_w > 0.0 { "nobonus" } else { "all" })
+                    .criteria(&name),
             ));
         }
-    }
-    let mut crit_rows: Vec<(Option<usize>, u64)> =
-        crits.into_iter().filter(|(_, w)| *w > 0).collect();
-    crit_rows.sort_by(|a, b| b.1.cmp(&a.1));
-    for (c, _) in crit_rows {
-        let name = crit_name(c);
-        push(ctx.population(
-            books.iter().filter(|b| fam(b.criteria) == c),
-            Meta::new(&format!("crit:{name}"), "criteria", &name).parent("all").criteria(&name),
-        ));
     }
     out
 }
@@ -832,14 +805,10 @@ mod tests {
                 "all",
                 "nobonus",
                 "bonus",
+                // Familles (2026-10-04) : un bonus se lit par son palier, jamais par
+                // criteria ; une seule famille hors bonus (base game) ne se détaille pas.
                 "tier:3",
                 "tier:4",
-                "tier:4/crit:freegame_4",
-                "tier:4/crit:wincap",
-                "crit:basegame",
-                "crit:freegame_3",
-                "crit:freegame_4",
-                "crit:wincap",
             ]
         );
         // Les paliers se partagent les bonus ; les tiers se partagent le mode.
@@ -923,7 +892,7 @@ mod tests {
             vec![bonus(1, 60, 50.0, 4, 0, 2), bonus(2, 40, 200.0, 4, 1, 2)];
         let ps = analyze(&books, 100.0, &names(), &[]);
         let keys: Vec<&str> = ps.iter().map(|p| p.key.as_str()).collect();
-        assert_eq!(keys, ["all", "tier:4", "crit:freegame_4"]);
+        assert_eq!(keys, ["all", "tier:4"]);
         let t4 = pop(&ps, "tier:4");
         assert_eq!(t4.parent.as_deref(), Some("all"));
         // Rentable = au moins le coût du mode (100x) : 40 %.

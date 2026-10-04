@@ -3,6 +3,7 @@ pub mod board;
 pub mod challenge;
 pub mod checks;
 pub mod crowdsim;
+pub mod family;
 pub mod feel;
 pub mod freespins;
 pub mod index_json;

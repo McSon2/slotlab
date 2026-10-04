@@ -4,6 +4,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use slotlab_core::family;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,10 +39,32 @@ fn search_meta_sync(state: &AppState, name: String) -> Json<serde_json::Value> {
             continue;
         };
         let idx = &books.index;
+        // Familles (`slotlab_core::family`) : paliers de bonus puis familles hors bonus, des
+        // plus fréquentes aux plus rares — jamais les seaux de simulation.
+        let fam_names: Vec<String> =
+            idx.criteria_names.iter().map(|n| family::criteria_family(n)).collect();
+        let mut tiers: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        let mut fams: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for b in &idx.books {
+            if b.fs_triggers > 0 {
+                tiers.insert(b.fs_tier);
+            } else if let Some(f) = fam_names.get(b.criteria as usize) {
+                *fams.entry(f.as_str()).or_default() += 1;
+            }
+        }
+        let mut fam_rows: Vec<(&str, usize)> = fams.into_iter().collect();
+        fam_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let families: Vec<String> = tiers
+            .iter()
+            .filter(|&&t| t > 0)
+            .chain(tiers.iter().filter(|&&t| t == 0))
+            .map(|&t| family::tier_label(t))
+            .chain(fam_rows.into_iter().map(|(f, _)| f.to_string()))
+            .collect();
         modes.push(json!({
             "mode": m.config.name,
             "imported": true,
-            "criteria": idx.criteria_names,
+            "criteria": families,
             "eventTypes": idx.event_type_names,
             "totalBooks": idx.books.len(),
         }));
@@ -153,6 +176,7 @@ struct Match {
     criteria: u16,
     fs_triggers: u16,
     fs_retriggers: u16,
+    fs_tier: u8,
 }
 
 async fn search(
@@ -175,7 +199,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
 
     let mut matches: Vec<Match> = Vec::new();
     let mut not_imported: Vec<String> = Vec::new();
-    // criteria_names per mode index, read once (the page is built after sorting).
+    // Criteria families per mode index, read once (the page is built after sorting).
     let mut criteria_names: Vec<Vec<String>> = vec![Vec::new(); game.modes.len()];
 
     for (mi, m) in game.modes.iter().enumerate() {
@@ -189,7 +213,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
             continue;
         };
         let idx = &books.index;
-        criteria_names[mi] = idx.criteria_names.clone();
+        criteria_names[mi] = idx.criteria_names.iter().map(|n| family::criteria_family(n)).collect();
 
         // Required / forbidden bits for the requested event types (in THIS mode).
         let bits_of = |names: &[String], unknown: &mut bool| -> u64 {
@@ -215,16 +239,21 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
         let mut ignored = false;
         let forbidden_bits = bits_of(&q.exclude_event_types, &mut ignored);
 
-        let criteria_idx = q.criteria.as_ref().filter(|c| !c.is_empty()).map(|c| {
-            idx.criteria_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(c))
-                .map(|i| i as u16)
+        // Filtre par FAMILLE : « 4 scatters » = tout book qui ouvre un bonus à 4 scatters ;
+        // « multi_spin » = tout spin sans bonus d'un criteria de cette famille.
+        let want = q.criteria.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        let want_tier: Option<u8> = want.and_then(|w| {
+            if w.eq_ignore_ascii_case(&family::tier_label(0)) {
+                Some(0)
+            } else {
+                w.strip_suffix(" scatters").and_then(|n| n.trim().parse().ok())
+            }
         });
-        if matches!(criteria_idx, Some(None)) {
-            continue;
-        }
-        let criteria_idx = criteria_idx.flatten();
+        let crit_ok: Vec<bool> = idx
+            .criteria_names
+            .iter()
+            .map(|n| want.is_some_and(|w| family::criteria_family(n).eq_ignore_ascii_case(w)))
+            .collect();
 
         for b in &idx.books {
             if let Some(min) = min_x100 {
@@ -237,8 +266,13 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
                     continue;
                 }
             }
-            if let Some(ci) = criteria_idx {
-                if b.criteria != ci {
+            if want.is_some() {
+                let ok = if b.fs_triggers > 0 {
+                    want_tier == Some(b.fs_tier)
+                } else {
+                    crit_ok.get(b.criteria as usize).copied().unwrap_or(false)
+                };
+                if !ok {
                     continue;
                 }
             }
@@ -273,6 +307,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
                 criteria: b.criteria,
                 fs_triggers: b.fs_triggers,
                 fs_retriggers: b.fs_retriggers,
+                fs_tier: b.fs_tier,
             });
         }
     }
@@ -308,7 +343,11 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
             // Weight per sim_id for the "1 in N" frequency of hits.
             let total_weight = m.lut.total_weight as f64;
             let weight = m.lut.row(h.sim_id).map_or(0, |r| r.weight);
-            let criteria = criteria_names[h.mode].get(h.criteria as usize).cloned();
+            let criteria = if h.fs_triggers > 0 {
+                Some(family::tier_label(h.fs_tier))
+            } else {
+                criteria_names[h.mode].get(h.criteria as usize).cloned()
+            };
             SearchHit {
                 mode: m.config.name.clone(),
                 sim_id: h.sim_id,

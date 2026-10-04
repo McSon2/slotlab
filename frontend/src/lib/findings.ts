@@ -798,16 +798,6 @@ function celebrations({ tiers, pops, stats }: FindingsInput, out: Issue[]) {
 
 // ── Pool: how many different books stand behind each part of a mode ─────────
 
-/** Criteria family: `multi_spin_0`, `multi_spin_big`, `multi_spin_cap` → `multi_spin`. */
-function family(criteria: string): string {
-  let c = criteria;
-  for (let prev = ''; prev !== c; ) {
-    prev = c;
-    c = c.replace(/_(0|zero|big|cap|tail|mid|court|win|loss|\d+)$/, '');
-  }
-  return c;
-}
-
 function pool({ pops, stats }: FindingsInput, out: Issue[]) {
   const gameMax = Math.max(0, ...stats.map((m) => m.stats.maxPayout));
   for (const mp of pops) {
@@ -817,19 +807,10 @@ function pool({ pops, stats }: FindingsInput, out: Issue[]) {
     // 1. Books per bonus tier, per plain-spin feature.
     const parts: { name: string; key: string; books: number }[] = [];
     for (const p of mp.populations) if (p.kind === 'tier') parts.push({ name: p.label, key: p.key, books: p.drawableBooks });
-    const fams = new Map<string, { books: number; rtpShare: number; probability: number; key: string; members: string[] }>();
+    // Plain-spin features: criteria populations are already FAMILIES (`slotlab-core/src/family.rs`).
     for (const p of mp.populations) {
-      if (p.kind !== 'criteria' || !p.criteria || p.retriggers) continue;
-      const f = family(p.criteria);
-      const g = fams.get(f) ?? { books: 0, rtpShare: 0, probability: 0, key: p.key, members: [] };
-      g.books += p.drawableBooks;
-      g.rtpShare += p.rtpShare;
-      g.probability += p.probability;
-      g.members.push(p.criteria);
-      fams.set(f, g);
-    }
-    for (const [f, g] of fams) {
-      if (g.members.length > 1 && g.probability < 0.05 && g.rtpShare >= REF.poolFeatureRtpShare) parts.push({ name: f, key: g.key, books: g.books });
+      if (p.kind !== 'criteria' || !p.criteria || p.retriggers || p.criteria === 'base game') continue;
+      if (p.probability < 0.05 && p.rtpShare >= REF.poolFeatureRtpShare) parts.push({ name: p.label, key: p.key, books: p.drawableBooks });
     }
     for (const part of parts) {
       if (part.books >= REF.poolMin) continue;

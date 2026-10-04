@@ -4,16 +4,16 @@
 //!     par les books qui déclenchent un bonus, et par chacun de ses paliers ;
 //!   · par palier : fréquence, gain moyen, part du RTP, et les retriggers
 //!     (moyenne, min, médiane, max, part des bonus qui n'en font aucun) ;
-//!   · par criteria : fréquence, gain moyen, part du RTP, part de ses books
-//!     qui déclenchent un bonus, retriggers moyens de ces bonus.
+//!   · par FAMILLE (`crate::family` : palier pour un bonus, famille du criteria
+//!     sinon) : fréquence, gain moyen, part du RTP, part de ses books qui
+//!     déclenchent un bonus, retriggers moyens de ces bonus.
 //!
 //! ── Générique ───────────────────────────────────────────────────────────────
 //! « Bonus » = au moins un `freeSpinTrigger` ; palier = nombre de `positions`
 //! du premier (`freespins::BookFs::tier`) ; retriggers = règle de `freespins`.
-//! Aucun nom de criteria n'est interprété : un `wincap` est rangé au palier de
-//! son vrai déclenchement (ou hors bonus s'il n'en a pas), une feature qui
-//! n'ouvre aucun bonus se lit comme telle dans le tableau des criteria — sans
-//! une ligne de code qui la connaisse.
+//! Un `wincap` est rangé au palier de son vrai déclenchement (ou hors bonus
+//! s'il n'en a pas) ; les noms de criteria ne sont lus que pour retirer leurs
+//! suffixes de simulation (`crate::family`).
 //!
 //! ── Pondération ─────────────────────────────────────────────────────────────
 //! Un book n'est pas un spin : chaque part est une part de POIDS de LUT. Le
@@ -136,7 +136,7 @@ struct TierAcc {
     count: usize,
     weight: u64,
     wp: f64,
-    criteria: BTreeMap<Option<usize>, u64>,
+    criteria: BTreeMap<String, u64>,
     /// (retriggers, poids) des books tirables.
     retriggers: Vec<(u16, u64)>,
 }
@@ -166,24 +166,15 @@ pub fn analyze(
     let total_wp: f64 = books.iter().map(|b| b.weight as f64 * x(b)).sum();
     let rtp = if t > 0.0 { total_wp / t / cost } else { 0.0 };
 
-    // Criteria de TRANCHE `<source>__<suffixe>` rangés sous leur source (cf. `population`).
-    let family_name = |n: &str| n.split("__").next().unwrap_or(n).to_string();
-    let fam_idx: Vec<usize> = criteria_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let f = family_name(n);
-            criteria_names.iter().position(|m| family_name(m) == f).unwrap_or(i)
-        })
-        .collect();
-    let fam = |c: Option<usize>| c.map(|i| fam_idx.get(i).copied().unwrap_or(i));
-
+    // Familles (`crate::family`) : un book à bonus se range sous son palier, un spin sans
+    // bonus sous la famille de son criteria — jamais par seau de simulation (2026-10-04).
+    let crit_of = |b: &BookFacts| b.criteria.and_then(|i| criteria_names.get(i)).map(|n| n.as_str());
     let lookup = BucketLookup::new(buckets);
     let mut bucket_w = vec![0u64; buckets.len()];
     let mut bucket_bonus = vec![0u64; buckets.len()];
     let mut bucket_tiers: Vec<BTreeMap<u8, u64>> = vec![BTreeMap::new(); buckets.len()];
     let mut tiers: BTreeMap<u8, TierAcc> = BTreeMap::new();
-    let mut crits: BTreeMap<Option<usize>, CriteriaAcc> = BTreeMap::new();
+    let mut crits: BTreeMap<String, CriteriaAcc> = BTreeMap::new();
 
     for b in books {
         let wp = b.weight as f64 * x(b);
@@ -199,12 +190,12 @@ pub fn analyze(
             e.count += 1;
             e.weight += b.weight;
             e.wp += wp;
-            *e.criteria.entry(fam(b.criteria)).or_default() += b.weight;
+            *e.criteria.entry(crate::family::criteria_family(crit_of(b).unwrap_or("(none)"))).or_default() += b.weight;
             if b.weight > 0 {
                 e.retriggers.push((b.retriggers, b.weight));
             }
         }
-        let c = crits.entry(fam(b.criteria)).or_default();
+        let c = crits.entry(crate::family::book_family(crit_of(b), b.bonus, b.tier)).or_default();
         c.count += 1;
         c.weight += b.weight;
         c.wp += wp;
@@ -223,10 +214,6 @@ pub fn analyze(
         }
     };
     let one_in = |w: u64| if w > 0 { t / w as f64 } else { f64::INFINITY };
-    let name = |c: Option<usize>| {
-        c.and_then(|i| criteria_names.get(i).map(|n| family_name(n)))
-            .unwrap_or_else(|| "(none)".to_string())
-    };
     // Palier 0 (« inconnu ») en dernier : c'est le reste, pas un palier.
     let tier_key = |tier: u8| (tier == 0, tier);
     let tier_label = |tier: u8| (tier > 0).then_some(tier);
@@ -256,7 +243,7 @@ pub fn analyze(
         .into_iter()
         .map(|(tier, acc)| {
             let contribution = if t > 0.0 { acc.wp / t / cost } else { 0.0 };
-            let mut crit: Vec<(Option<usize>, u64)> = acc.criteria.into_iter().collect();
+            let mut crit: Vec<(String, u64)> = acc.criteria.into_iter().collect();
             crit.sort_by(|a, b| b.1.cmp(&a.1));
             let row = TierRow {
                 tier: tier_label(tier),
@@ -271,7 +258,7 @@ pub fn analyze(
                 rtp_contribution: contribution,
                 rtp_share: if rtp > 0.0 { contribution / rtp } else { 0.0 },
                 retriggers: retrigger_stats(acc.retriggers),
-                criteria: crit.into_iter().map(|(c, _)| name(c)).collect(),
+                criteria: crit.into_iter().map(|(c, _)| c).collect(),
             };
             (tier, row)
         })
@@ -283,7 +270,7 @@ pub fn analyze(
         .map(|(c, acc)| {
             let contribution = if t > 0.0 { acc.wp / t / cost } else { 0.0 };
             CriteriaRow {
-                criteria: name(c),
+                criteria: c,
                 count: acc.count,
                 probability: if t > 0.0 { acc.weight as f64 / t } else { 0.0 },
                 one_in: one_in(acc.weight),
@@ -464,7 +451,8 @@ mod tests {
         let books = mode();
         let p = analyze(&books, 1.0, &buckets_of(&books), &names());
         let by = |n: &str| p.criteria.iter().find(|c| c.criteria == n).unwrap();
-        let fg2 = by("freegame_2");
+        // Un book à bonus se range sous son palier (familles, 2026-10-04).
+        let fg2 = by("2 scatters");
         assert_eq!(fg2.count, 3);
         assert_eq!(fg2.books_with_trigger, 3);
         assert_eq!(fg2.bonus_share, 1.0);
@@ -475,7 +463,7 @@ mod tests {
         assert_eq!(wm.retriggers_mean, None);
         assert!((wm.avg_win - 15.0).abs() < 1e-12);
         // Le plus probable d'abord.
-        assert_eq!(p.criteria[0].criteria, "basegame");
+        assert_eq!(p.criteria[0].criteria, "base game");
     }
 
     #[test]
