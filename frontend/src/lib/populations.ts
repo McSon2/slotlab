@@ -22,6 +22,8 @@ export interface Band {
   /** `null`: open-ended last band. `start === end === 0`: exact zero. */
   end: number | null;
   books: number;
+  /** Effective books of the band, (Σw)² / Σw². */
+  effective: number;
   share: number;
   cumShare: number;
   valueShare: number;

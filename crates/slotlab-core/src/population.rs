@@ -86,6 +86,8 @@ pub struct Band {
     pub start: f64,
     pub end: Option<f64>,
     pub books: usize,
+    /// Books effectifs de la tranche (Kish : (Σw)² / Σw²) — combien portent vraiment le poids.
+    pub effective: f64,
     /// Part de la population qui tombe dans la tranche.
     pub share: f64,
     /// P(gain < end) : la part cumulée à la sortie de la tranche.
@@ -567,6 +569,7 @@ fn bands(rows: &[&BookFacts], w: f64, value: f64) -> Vec<Band> {
     let edges: Vec<u64> = BAND_EDGES.iter().map(|e| (e * 100.0).round() as u64).collect();
     let n = edges.len() + 2;
     let mut acc = vec![(0usize, 0.0_f64, 0.0_f64); n];
+    let mut acc_w2 = vec![0.0_f64; n];
     for b in rows {
         let i = if b.payout_x100 == 0 {
             0
@@ -576,6 +579,7 @@ fn bands(rows: &[&BookFacts], w: f64, value: f64) -> Vec<Band> {
         acc[i].0 += 1;
         acc[i].1 += b.weight as f64;
         acc[i].2 += b.weight as f64 * x(b);
+        acc_w2[i] += (b.weight as f64).powi(2);
     }
     let mut cum = 0.0;
     let mut out = Vec::with_capacity(n);
@@ -590,6 +594,7 @@ fn bands(rows: &[&BookFacts], w: f64, value: f64) -> Vec<Band> {
             start,
             end,
             books,
+            effective: if acc_w2[i] > 0.0 { bw * bw / acc_w2[i] } else { 0.0 },
             share: bw / w,
             cum_share: cum.min(1.0),
             value_share: if value > 0.0 { bv / value } else { 0.0 },

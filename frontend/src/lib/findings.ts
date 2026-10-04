@@ -17,7 +17,7 @@
  */
 
 import { fmtPct, type GameCheckReport, type ModeStats, type ModeTiers, type TierSpec } from './api';
-import { fx, pct, oneIn, threshold, type ModePopulations, type Population } from './populations';
+import { fx, pct, oneIn, threshold, type Band, type ModePopulations, type Population } from './populations';
 
 export type Severity = 'blocking' | 'serious' | 'minor' | 'context';
 export const SEVERITIES: Severity[] = ['blocking', 'serious', 'minor', 'context'];
@@ -93,6 +93,15 @@ export const REF = {
   outsideBonusTopShare: 0.3,
   /** At most this share of a mode's ≥ 100x (or ≥ 1,000x) wins may land on a round multiplier (chance: ~0.1 %). */
   roundShare: 0.02,
+  /** Studio rule (Toxic Spins, 2026-10-04): drawable books per bonus tier, and per plain-spin feature carrying ≥ `poolFeatureRtpShare` of the RTP. */
+  poolMin: 100_000,
+  poolFeatureRtpShare: 0.05,
+  /** Drawable books on the mode's max win (all identical in payout, not in board). */
+  poolMaxWinMin: 10_000,
+  /** A MEMORABLE band of a bonus tier (≥ `memorableFrom`, or ≥ `memorableFromCost` × the price of a buy) needs this many EFFECTIVE books (studio, 2026-10-04). */
+  bandEffectiveMin: 10_000,
+  memorableFrom: 1_000,
+  memorableFromCost: 10,
 };
 
 const WHY = {
@@ -108,6 +117,8 @@ const WHY = {
   celebrations: 'From the Win tiers ladder: a plaque that lands every few spins is the rhythm of the mode, not an event.',
   outsideBonus: `Studio rule (2026-09-23, after Blood Water): the big wins belong to the bonuses. A ≥ 100x without a bonus at most 1 in ${REF.outsideBonus100OneIn.toLocaleString('en-US')} spins per 1x of cost (Blood Water, live: 1 / 2,997 — judged too many), and at most ${REF.outsideBonusTopShare * 100} % of the ≥ 1,000x / ≥ 5,000x wins without a bonus (Blood Water: 67-77 % above 5,000x). A huge win on a plain spin reads as artificial and steals the show from the bonus.`,
   round: `Studio rule: no spin paying x100 / x1,000 / x2,000 / x5,000 on the nose — a round multiplier reads as fake. An arbitrary win lands on a multiple of 100x ~0.1 % of the time, of 1,000x ~0.01 %. Above ${REF.roundShare * 100} % of the mode's big wins, a « one board × one multiplier » feature (wild multiplier, multi spin, Degen) or full screens make them. Mode max win excluded. Fix on the LUT: penalise round totals inside each band.`,
+  pool: `Studio rule (2026-10-04, Toxic Spins: 34,000 books behind the 5-scatter bonus of the base game): at least ${(100_000).toLocaleString('en-US')} drawable books per bonus tier and per plain-spin feature (multi spin…), at least ${(10_000).toLocaleString('en-US')} on the max win, the rest for the base game. The lookup table sets the frequencies; the pool sets how many DIFFERENT rounds a player can see. Fix: re-allocate the criteria quotas (same total), rebuild the lookup table frozen — the distribution must not move.`,
+  poolBands: 'Studio rule (2026-10-04): every band of a bonus from 1,000x up (from 10× the price of a buy) stands on at least 10,000 EFFECTIVE books ((Σw)² / Σw²) — those are the wins people film and remember; across all players the same round comes back after about √(effective books) hits (Toxic Spins HIDDEN 50k-100k: 271 effective for 1 hit in 4,181 spins). Below, no minimum: a 30x bonus is not remembered. An empty band between two populated ones (often just under the max win) is a hole in that bonus. Fix: a targeted criteria (same bonus, win kept inside the band) for the missing books, the lookup table frozen; few effective books among many books = the table piles the weight on a few of them.',
   ess: `Fewer than ${REF.essMin} effective outcomes ((Σw)² / Σw²): players will see the same results again and again.`,
 };
 
@@ -132,6 +143,7 @@ export function allFindings(input: FindingsInput): Issue[] {
   anteTiers(input, out);
   acrossModes(input, out);
   celebrations(input, out);
+  pool(input, out);
   data(input, out);
   return mergeAcrossModes(out).sort(bySeverity);
 }
@@ -781,6 +793,79 @@ function celebrations({ tiers, pops, stats }: FindingsInput, out: Issue[]) {
       why: 'Celebration findings are only meaningful against the ladder the game really uses.',
       target: { view: 'tiers' },
     });
+  }
+}
+
+// ── Pool: how many different books stand behind each part of a mode ─────────
+
+/** Criteria family: `multi_spin_0`, `multi_spin_big`, `multi_spin_cap` → `multi_spin`. */
+function family(criteria: string): string {
+  let c = criteria;
+  for (let prev = ''; prev !== c; ) {
+    prev = c;
+    c = c.replace(/_(0|zero|big|cap|tail|mid|court|win|loss|\d+)$/, '');
+  }
+  return c;
+}
+
+function pool({ pops, stats }: FindingsInput, out: Issue[]) {
+  const gameMax = Math.max(0, ...stats.map((m) => m.stats.maxPayout));
+  for (const mp of pops) {
+    if (!mp.imported) continue;
+    const d = (key: string) => ({ mode: mp.mode, category: 'Sample' as const, target: { view: 'explore' as const, mode: mp.mode, key } });
+
+    // 1. Books per bonus tier, per plain-spin feature.
+    const parts: { name: string; key: string; books: number }[] = [];
+    for (const p of mp.populations) if (p.kind === 'tier') parts.push({ name: p.label, key: p.key, books: p.drawableBooks });
+    const fams = new Map<string, { books: number; rtpShare: number; probability: number; key: string; members: string[] }>();
+    for (const p of mp.populations) {
+      if (p.kind !== 'criteria' || !p.criteria || p.retriggers) continue;
+      const f = family(p.criteria);
+      const g = fams.get(f) ?? { books: 0, rtpShare: 0, probability: 0, key: p.key, members: [] };
+      g.books += p.drawableBooks;
+      g.rtpShare += p.rtpShare;
+      g.probability += p.probability;
+      g.members.push(p.criteria);
+      fams.set(f, g);
+    }
+    for (const [f, g] of fams) {
+      if (g.members.length > 1 && g.probability < 0.05 && g.rtpShare >= REF.poolFeatureRtpShare) parts.push({ name: f, key: g.key, books: g.books });
+    }
+    for (const part of parts) {
+      if (part.books >= REF.poolMin) continue;
+      const excess = REF.poolMin / Math.max(part.books, 1);
+      out.push({ ...d(part.key), rule: 'pool', severity: graded(excess), title: `${part.name}: too few books`, big: fk(part.books), ref: `≥ ${fk(REF.poolMin)}`, excess, text: `${part.books.toLocaleString('en-US')} drawable books behind ${part.name}.`, why: WHY.pool, merge: `pool:${part.name}`, sig: [part.books] });
+    }
+
+    // 2. Books on the max win.
+    const all = mp.populations.find((p) => p.kind === 'all');
+    const top = all?.topPayouts[0];
+    if (top && gameMax > 0 && top.payout >= gameMax && top.books < REF.poolMaxWinMin) {
+      const excess = REF.poolMaxWinMin / Math.max(top.books, 1);
+      out.push({ ...d('all'), rule: 'pool-max', severity: graded(excess), title: 'Few books on the max win', big: fk(top.books), ref: `≥ ${fk(REF.poolMaxWinMin)}`, excess, text: `${top.books.toLocaleString('en-US')} drawable books pay ${fx(top.payout)}.`, why: WHY.pool, merge: 'pool-max', sig: [top.books] });
+    }
+
+    // 3. Inside each bonus tier: holes and thin bands.
+    for (const p of mp.populations) {
+      if (p.kind !== 'tier') continue;
+      const bs = p.bands.filter((b) => b.end !== 0); // the exact-zero band apart
+      const maxBand = bs.findIndex((b) => p.max >= b.start && (b.end === null || p.max < b.end));
+      const used = bs.map((b, i) => b.books > 0 && i !== maxBand);
+      const first = used.indexOf(true);
+      const last = Math.max(used.lastIndexOf(true), p.max >= gameMax && maxBand >= 0 ? maxBand : -1);
+      const label = (b: Band) => (b.end === null ? `${fk(b.start)}+` : `${fk(b.start)}–${fk(b.end)}`);
+      const holes = first < 0 ? [] : bs.filter((b, i) => i > first && i < last && i !== maxBand && b.books === 0).map(label);
+      if (holes.length) {
+        out.push({ ...d(p.key), rule: 'pool-hole', severity: 'serious', title: `${p.label}: no book in ${holes[0]}${holes.length > 1 ? ` (+${holes.length - 1})` : ''}`, big: '0', ref: 'books', excess: 2 + holes.length, text: `Empty: ${holes.join(', ')} — between populated bands of the same bonus.`, why: WHY.poolBands, merge: `pool-hole:${p.label}`, sig: [holes.length] });
+      }
+      const memorable = Math.max(REF.memorableFrom, REF.memorableFromCost * mp.cost);
+      const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < REF.bandEffectiveMin);
+      if (thin.length) {
+        const worst = thin.reduce((a, b) => (b.effective < a.effective ? b : a));
+        const excess = REF.bandEffectiveMin / Math.max(worst.effective, 1);
+        out.push({ ...d(p.key), rule: 'pool-thin', severity: graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
+      }
+    }
   }
 }
 
