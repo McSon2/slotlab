@@ -812,6 +812,8 @@ function pool({ pops, stats }: FindingsInput, out: Issue[]) {
     // Plain-spin features: criteria populations are already FAMILIES (`slotlab-core/src/family.rs`).
     for (const p of mp.populations) {
       if (p.kind !== 'criteria' || !p.criteria || p.retriggers || p.criteria === 'base game') continue;
+      // The max win alone (DEGEN `wincap`) is not a feature: `pool-max` covers it.
+      if (p.min === p.max && p.max >= gameMax) continue;
       if (p.probability < 0.05 && p.rtpShare >= REF.poolFeatureRtpShare) parts.push({ name: p.label, key: p.key, books: p.drawableBooks });
     }
     for (const part of parts) {
