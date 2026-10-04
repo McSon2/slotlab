@@ -276,8 +276,21 @@ pub fn analyze(
     ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
 
     let ctx = Ctx { total_w, mode_value, mode_max_x100, bonus_w, cost, thresholds: ts, cdf: cdf_grid() };
+    // Criteria de TRANCHE `<source>__<suffixe>` (échantillonnage ciblé d'une tranche de gain,
+    // même mécanique que la source) : rangés sous leur source, sinon chaque tranche ciblée se
+    // lirait comme une variante du bonus (Toxic Spins : 15 lignes « 4 scatters · freegame_4__tN »).
+    let family_name = |n: &str| n.split("__").next().unwrap_or(n).to_string();
+    let fam_idx: Vec<usize> = criteria_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let f = family_name(n);
+            criteria_names.iter().position(|m| family_name(m) == f).unwrap_or(i)
+        })
+        .collect();
+    let fam = |c: Option<usize>| c.map(|i| fam_idx.get(i).copied().unwrap_or(i));
     let crit_name = |c: Option<usize>| {
-        c.and_then(|i| criteria_names.get(i).cloned())
+        c.and_then(|i| criteria_names.get(i).map(|n| family_name(n)))
             .unwrap_or_else(|| "(none)".to_string())
     };
     let tier_label = |t: u8| {
@@ -313,10 +326,10 @@ pub fn analyze(
     let mut crits: BTreeMap<Option<usize>, u64> = BTreeMap::new();
     for b in books {
         if b.bonus {
-            *tiers.entry((b.tier == 0, b.tier)).or_default().entry(b.criteria).or_default() +=
+            *tiers.entry((b.tier == 0, b.tier)).or_default().entry(fam(b.criteria)).or_default() +=
                 b.weight;
         }
-        *crits.entry(b.criteria).or_default() += b.weight;
+        *crits.entry(fam(b.criteria)).or_default() += b.weight;
     }
     let bonus_parent = if any_nobonus { "bonus" } else { "all" };
     for (&(_, tier), by_crit) in &tiers {
@@ -334,7 +347,7 @@ pub fn analyze(
         for (c, _) in variants {
             let name = crit_name(c);
             push(ctx.population(
-                books.iter().filter(|b| b.bonus && b.tier == tier && b.criteria == c),
+                books.iter().filter(|b| b.bonus && b.tier == tier && fam(b.criteria) == c),
                 Meta::new(
                     &format!("{key}/crit:{name}"),
                     "variant",
@@ -352,7 +365,7 @@ pub fn analyze(
     for (c, _) in crit_rows {
         let name = crit_name(c);
         push(ctx.population(
-            books.iter().filter(|b| b.criteria == c),
+            books.iter().filter(|b| fam(b.criteria) == c),
             Meta::new(&format!("crit:{name}"), "criteria", &name).parent("all").criteria(&name),
         ));
     }

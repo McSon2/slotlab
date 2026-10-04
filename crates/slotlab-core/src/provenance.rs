@@ -166,6 +166,18 @@ pub fn analyze(
     let total_wp: f64 = books.iter().map(|b| b.weight as f64 * x(b)).sum();
     let rtp = if t > 0.0 { total_wp / t / cost } else { 0.0 };
 
+    // Criteria de TRANCHE `<source>__<suffixe>` rangés sous leur source (cf. `population`).
+    let family_name = |n: &str| n.split("__").next().unwrap_or(n).to_string();
+    let fam_idx: Vec<usize> = criteria_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let f = family_name(n);
+            criteria_names.iter().position(|m| family_name(m) == f).unwrap_or(i)
+        })
+        .collect();
+    let fam = |c: Option<usize>| c.map(|i| fam_idx.get(i).copied().unwrap_or(i));
+
     let lookup = BucketLookup::new(buckets);
     let mut bucket_w = vec![0u64; buckets.len()];
     let mut bucket_bonus = vec![0u64; buckets.len()];
@@ -187,12 +199,12 @@ pub fn analyze(
             e.count += 1;
             e.weight += b.weight;
             e.wp += wp;
-            *e.criteria.entry(b.criteria).or_default() += b.weight;
+            *e.criteria.entry(fam(b.criteria)).or_default() += b.weight;
             if b.weight > 0 {
                 e.retriggers.push((b.retriggers, b.weight));
             }
         }
-        let c = crits.entry(b.criteria).or_default();
+        let c = crits.entry(fam(b.criteria)).or_default();
         c.count += 1;
         c.weight += b.weight;
         c.wp += wp;
@@ -212,7 +224,7 @@ pub fn analyze(
     };
     let one_in = |w: u64| if w > 0 { t / w as f64 } else { f64::INFINITY };
     let name = |c: Option<usize>| {
-        c.and_then(|i| criteria_names.get(i).cloned())
+        c.and_then(|i| criteria_names.get(i).map(|n| family_name(n)))
             .unwrap_or_else(|| "(none)".to_string())
     };
     // Palier 0 (« inconnu ») en dernier : c'est le reste, pas un palier.
