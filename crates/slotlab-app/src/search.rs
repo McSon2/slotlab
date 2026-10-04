@@ -4,6 +4,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::books::format::{BookRecord, ModeBookIndex};
 use slotlab_core::family;
 
 pub fn router() -> Router<AppState> {
@@ -39,28 +40,7 @@ fn search_meta_sync(state: &AppState, name: String) -> Json<serde_json::Value> {
             continue;
         };
         let idx = &books.index;
-        // Familles (`slotlab_core::family`) : paliers de bonus puis familles hors bonus, des
-        // plus fréquentes aux plus rares — jamais les seaux de simulation.
-        let fam_names: Vec<String> =
-            idx.criteria_names.iter().map(|n| family::criteria_family(n)).collect();
-        let mut tiers: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-        let mut fams: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for b in &idx.books {
-            if b.fs_triggers > 0 {
-                tiers.insert(b.fs_tier);
-            } else if let Some(f) = fam_names.get(b.criteria as usize) {
-                *fams.entry(f.as_str()).or_default() += 1;
-            }
-        }
-        let mut fam_rows: Vec<(&str, usize)> = fams.into_iter().collect();
-        fam_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        let families: Vec<String> = tiers
-            .iter()
-            .filter(|&&t| t > 0)
-            .chain(tiers.iter().filter(|&&t| t == 0))
-            .map(|&t| family::tier_label(t))
-            .chain(fam_rows.into_iter().map(|(f, _)| f.to_string()))
-            .collect();
+        let families = mode_families(idx);
         modes.push(json!({
             "mode": m.config.name,
             "imported": true,
@@ -70,6 +50,80 @@ fn search_meta_sync(state: &AppState, name: String) -> Json<serde_json::Value> {
         }));
     }
     Json(json!({ "game": name, "modes": modes }))
+}
+
+/// Familles d'un mode (`slotlab_core::family`), dans l'ordre d'affichage : paliers de bonus
+/// croissants (« untiered » en dernier), puis familles hors bonus des plus fréquentes aux
+/// plus rares. Partagé par la recherche (Mac, Play) et la console du hub (REELHOUSE).
+pub(crate) fn mode_families(idx: &ModeBookIndex) -> Vec<String> {
+    let fam_names: Vec<String> = idx.criteria_names.iter().map(|n| family::criteria_family(n)).collect();
+    let mut tiers: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    let mut fams: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for b in &idx.books {
+        if b.fs_triggers > 0 {
+            tiers.insert(b.fs_tier);
+        } else if let Some(f) = fam_names.get(b.criteria as usize) {
+            *fams.entry(f.as_str()).or_default() += 1;
+        }
+    }
+    let mut fam_rows: Vec<(&str, usize)> = fams.into_iter().collect();
+    fam_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    tiers
+        .iter()
+        .filter(|&&t| t > 0)
+        .chain(tiers.iter().filter(|&&t| t == 0))
+        .map(|&t| family::tier_label(t))
+        .chain(fam_rows.into_iter().map(|(f, _)| f.to_string()))
+        .collect()
+}
+
+/// Filtre par FAMILLE : « 4 scatters » = tout book qui ouvre un bonus à 4 scatters ;
+/// « multi_spin » = tout spin sans bonus d'un criteria de cette famille.
+pub(crate) struct FamilyFilter {
+    active: bool,
+    want_tier: Option<u8>,
+    crit_ok: Vec<bool>,
+}
+
+impl FamilyFilter {
+    pub(crate) fn new(idx: &ModeBookIndex, want: Option<&str>) -> Self {
+        let want = want.map(str::trim).filter(|c| !c.is_empty());
+        let want_tier = want.and_then(|w| {
+            if w.eq_ignore_ascii_case(&family::tier_label(0)) {
+                Some(0)
+            } else {
+                w.strip_suffix(" scatters").and_then(|n| n.trim().parse().ok())
+            }
+        });
+        let crit_ok = idx
+            .criteria_names
+            .iter()
+            .map(|n| want.is_some_and(|w| family::criteria_family(n).eq_ignore_ascii_case(w)))
+            .collect();
+        Self { active: want.is_some(), want_tier, crit_ok }
+    }
+
+    pub(crate) fn keeps(&self, b: &BookRecord) -> bool {
+        !self.active
+            || if b.fs_triggers > 0 {
+                self.want_tier == Some(b.fs_tier)
+            } else {
+                self.crit_ok.get(b.criteria as usize).copied().unwrap_or(false)
+            }
+    }
+}
+
+/// Libellé d'un book : son palier s'il ouvre un bonus, sinon la famille de son criteria.
+pub(crate) fn book_label(idx: &ModeBookIndex, b: &BookRecord) -> Option<String> {
+    family_label(&idx.criteria_names, b.criteria, b.fs_triggers, b.fs_tier)
+}
+
+fn family_label(names: &[String], criteria: u16, fs_triggers: u16, fs_tier: u8) -> Option<String> {
+    if fs_triggers > 0 {
+        Some(family::tier_label(fs_tier))
+    } else {
+        names.get(criteria as usize).map(|n| family::criteria_family(n))
+    }
 }
 
 /// Presence of the bonus in a book.
@@ -213,7 +267,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
             continue;
         };
         let idx = &books.index;
-        criteria_names[mi] = idx.criteria_names.iter().map(|n| family::criteria_family(n)).collect();
+        criteria_names[mi] = idx.criteria_names.clone();
 
         // Required / forbidden bits for the requested event types (in THIS mode).
         let bits_of = |names: &[String], unknown: &mut bool| -> u64 {
@@ -239,21 +293,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
         let mut ignored = false;
         let forbidden_bits = bits_of(&q.exclude_event_types, &mut ignored);
 
-        // Filtre par FAMILLE : « 4 scatters » = tout book qui ouvre un bonus à 4 scatters ;
-        // « multi_spin » = tout spin sans bonus d'un criteria de cette famille.
-        let want = q.criteria.as_deref().map(str::trim).filter(|c| !c.is_empty());
-        let want_tier: Option<u8> = want.and_then(|w| {
-            if w.eq_ignore_ascii_case(&family::tier_label(0)) {
-                Some(0)
-            } else {
-                w.strip_suffix(" scatters").and_then(|n| n.trim().parse().ok())
-            }
-        });
-        let crit_ok: Vec<bool> = idx
-            .criteria_names
-            .iter()
-            .map(|n| want.is_some_and(|w| family::criteria_family(n).eq_ignore_ascii_case(w)))
-            .collect();
+        let fam_filter = FamilyFilter::new(idx, q.criteria.as_deref());
 
         for b in &idx.books {
             if let Some(min) = min_x100 {
@@ -266,15 +306,8 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
                     continue;
                 }
             }
-            if want.is_some() {
-                let ok = if b.fs_triggers > 0 {
-                    want_tier == Some(b.fs_tier)
-                } else {
-                    crit_ok.get(b.criteria as usize).copied().unwrap_or(false)
-                };
-                if !ok {
-                    continue;
-                }
+            if !fam_filter.keeps(b) {
+                continue;
             }
             if required_bits != 0 && (b.event_bits & required_bits) != required_bits {
                 continue;
@@ -343,11 +376,7 @@ fn search_sync(state: &AppState, q: SearchQuery) -> Json<serde_json::Value> {
             // Weight per sim_id for the "1 in N" frequency of hits.
             let total_weight = m.lut.total_weight as f64;
             let weight = m.lut.row(h.sim_id).map_or(0, |r| r.weight);
-            let criteria = if h.fs_triggers > 0 {
-                Some(family::tier_label(h.fs_tier))
-            } else {
-                criteria_names[h.mode].get(h.criteria as usize).cloned()
-            };
+            let criteria = family_label(&criteria_names[h.mode], h.criteria, h.fs_triggers, h.fs_tier);
             SearchHit {
                 mode: m.config.name.clone(),
                 sim_id: h.sim_id,

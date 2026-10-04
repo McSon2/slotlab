@@ -16,6 +16,7 @@
 //! regroupent.
 
 /// Suffixes qui disent comment un book a été tiré, pas ce qu'il est.
+// (plus `_sN`, le nombre de scatters montrés, cf. `criteria_family`)
 const SIM_SUFFIXES: &[&str] = &["0", "zero", "big", "cap", "tail", "mid", "court", "small", "win", "loss"];
 
 /// Spins ordinaires du jeu de base, quel que soit leur seau.
@@ -31,7 +32,9 @@ pub fn criteria_family(name: &str) -> String {
     }
     loop {
         let Some((head, tail)) = c.rsplit_once('_') else { break };
-        if head.is_empty() || !SIM_SUFFIXES.contains(&tail) {
+        // `_sN` : nombre de scatters MONTRÉS par un perdant (`mystery_s2_0`), pas une famille.
+        let shown_scatters = tail.len() > 1 && tail.starts_with('s') && tail[1..].bytes().all(|c| c.is_ascii_digit());
+        if head.is_empty() || !(SIM_SUFFIXES.contains(&tail) || shown_scatters) {
             break;
         }
         c = head.to_string();
@@ -79,7 +82,8 @@ mod tests {
             ("multi_spin_cap", "multi_spin"),
             ("degen_tail", "degen"),
             ("degen_0", "degen"),
-            ("mystery_s2_0", "mystery_s2"),
+            ("mystery_s2_0", "mystery"),
+            ("hidden_s2_0", "hidden"),
             ("freegame_4__t16", "freegame_4"),
             ("wincap", "wincap"),
         ] {

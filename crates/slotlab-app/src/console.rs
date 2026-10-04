@@ -60,7 +60,7 @@ async fn meta(State(state): State<AppState>, Extension(game): Extension<Arc<HubG
                 .books
                 .mode_books(&loaded, &m.config.name)
                 .ok()
-                .map(|b| b.index.criteria_names.clone())
+                .map(|b| crate::search::mode_families(&b.index))
                 .unwrap_or_default();
             json!({
                 "mode": m.config.name,
@@ -113,17 +113,8 @@ async fn search(
     let idx = &books.index;
     let min = req.payout_min.map(|v| (v * 100.0).round() as u64);
     let max = req.payout_max.map(|v| (v * 100.0).round() as u64);
-    let crit = req.criteria.as_ref().filter(|c| !c.is_empty()).map(|c| {
-        idx.criteria_names
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(c))
-            .map(|i| i as u16)
-    });
-    // Critère demandé mais absent de ce mode : zéro résultat, pas tous.
-    if matches!(crit, Some(None)) {
-        return Json(json!({ "total": 0, "hits": [] })).into_response();
-    }
-    let crit = crit.flatten();
+    // Familles, comme la recherche de SlotLab (`search::FamilyFilter`).
+    let fam = crate::search::FamilyFilter::new(idx, req.criteria.as_deref());
     let limit = req.limit.unwrap_or(40).min(200);
 
     let mut found: Vec<&crate::books::format::BookRecord> = Vec::new();
@@ -131,7 +122,7 @@ async fn search(
         if min.is_some_and(|m| b.payout_x100 < m) || max.is_some_and(|m| b.payout_x100 > m) {
             continue;
         }
-        if crit.is_some_and(|c| b.criteria != c) {
+        if !fam.keeps(b) {
             continue;
         }
         // Sans ce filtre, « gros gain » ne rend que des tours à bonus : au-delà
@@ -153,7 +144,7 @@ async fn search(
             json!({
                 "simId": b.sim_id,
                 "payout": b.payout_x100 as f64 / 100.0,
-                "criteria": idx.criteria_names.get(b.criteria as usize),
+                "criteria": crate::search::book_label(idx, b),
                 "fsTriggers": b.fs_triggers,
                 "retriggers": b.fs_retriggers,
             })
