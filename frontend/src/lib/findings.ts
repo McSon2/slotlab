@@ -100,6 +100,8 @@ export const REF = {
   poolMaxWinMin: 10_000,
   /** A MEMORABLE band of a bonus tier (≥ `memorableFrom`, or ≥ `memorableFromCost` × the price of a buy) needs this many EFFECTIVE books (studio, 2026-10-04). */
   bandEffectiveMin: 10_000,
+  /** Lifetime volume of a hit game, in spins of a 1x mode (÷ the mode's cost for the others): a band only matters if the same round would come back within it. */
+  lifetimeSpins: 1_000_000_000,
   memorableFrom: 1_000,
   memorableFromCost: 10,
 };
@@ -118,7 +120,7 @@ const WHY = {
   outsideBonus: `Studio rule (2026-09-23, after Blood Water): the big wins belong to the bonuses. A ≥ 100x without a bonus at most 1 in ${REF.outsideBonus100OneIn.toLocaleString('en-US')} spins per 1x of cost (Blood Water, live: 1 / 2,997 — judged too many), and at most ${REF.outsideBonusTopShare * 100} % of the ≥ 1,000x / ≥ 5,000x wins without a bonus (Blood Water: 67-77 % above 5,000x). A huge win on a plain spin reads as artificial and steals the show from the bonus.`,
   round: `Studio rule: no spin paying x100 / x1,000 / x2,000 / x5,000 on the nose — a round multiplier reads as fake. An arbitrary win lands on a multiple of 100x ~0.1 % of the time, of 1,000x ~0.01 %. Above ${REF.roundShare * 100} % of the mode's big wins, a « one board × one multiplier » feature (wild multiplier, multi spin, Degen) or full screens make them. Mode max win excluded. Fix on the LUT: penalise round totals inside each band.`,
   pool: `Studio rule (2026-10-04, Toxic Spins: 34,000 books behind the 5-scatter bonus of the base game): at least ${(100_000).toLocaleString('en-US')} drawable books per bonus tier and per plain-spin feature (multi spin…), at least ${(10_000).toLocaleString('en-US')} on the max win, the rest for the base game. The lookup table sets the frequencies; the pool sets how many DIFFERENT rounds a player can see. Fix: re-allocate the criteria quotas (same total), rebuild the lookup table frozen — the distribution must not move.`,
-  poolBands: 'Studio rule (2026-10-04): every band of a bonus from 1,000x up (from 10× the price of a buy) stands on at least 10,000 EFFECTIVE books ((Σw)² / Σw²) — those are the wins people film and remember; across all players the same round comes back after about √(effective books) hits (Toxic Spins HIDDEN 50k-100k: 271 effective for 1 hit in 4,181 spins). Below, no minimum: a 30x bonus is not remembered. An empty band between two populated ones (often just under the max win) is a hole in that bonus. Fix: a targeted criteria (same bonus, win kept inside the band) for the missing books, the lookup table frozen; few effective books among many books = the table piles the weight on a few of them.',
+  poolBands: 'Studio rule (2026-10-04): every band of a bonus from 1,000x up (from 10× the price of a buy) stands on at least 10,000 EFFECTIVE books ((Σw)² / Σw²) — those are the wins people film and remember; across all players the same round comes back after about √(π/2 · effective books) hits, so a band only counts if that happens within a hit game’s life (1 billion spins ÷ the mode’s cost) (Toxic Spins HIDDEN 50k-100k: 271 effective for 1 hit in 4,181 spins). Below, no minimum: a 30x bonus is not remembered. An empty band between two populated ones (often just under the max win) is a hole in that bonus. Fix: a targeted criteria (same bonus, win kept inside the band) for the missing books, the lookup table frozen; few effective books among many books = the table piles the weight on a few of them.',
   ess: `Fewer than ${REF.essMin} effective outcomes ((Σw)² / Σw²): players will see the same results again and again.`,
 };
 
@@ -840,11 +842,15 @@ function pool({ pops, stats }: FindingsInput, out: Issue[]) {
         out.push({ ...d(p.key), rule: 'pool-hole', severity: 'serious', title: `${p.label}: no book in ${holes[0]}${holes.length > 1 ? ` (+${holes.length - 1})` : ''}`, big: '0', ref: 'books', excess: 2 + holes.length, text: `Empty: ${holes.join(', ')} — between populated bands of the same bonus.`, why: WHY.poolBands, merge: `pool-hole:${p.label}`, sig: [holes.length] });
       }
       const memorable = Math.max(REF.memorableFrom, REF.memorableFromCost * mp.cost);
-      const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < REF.bandEffectiveMin);
+      // Same round seen twice after ≈ √(π/2 · effective) hits of the band (birthday rule): a band
+      // reached once in billions of spins never repeats in a game's life, whatever its books.
+      const lifetime = REF.lifetimeSpins / Math.max(mp.cost, 1);
+      const repeatsAfter = (b: Band) => Math.sqrt((Math.PI / 2) * b.effective) / Math.max(b.share * p.probability, 1e-300);
+      const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < REF.bandEffectiveMin && repeatsAfter(b) < lifetime);
       if (thin.length) {
         const worst = thin.reduce((a, b) => (b.effective < a.effective ? b : a));
         const excess = REF.bandEffectiveMin / Math.max(worst.effective, 1);
-        out.push({ ...d(p.key), rule: 'pool-thin', severity: graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
+        out.push({ ...d(p.key), rule: 'pool-thin', severity: graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books — the same round comes back after ~${fk(Math.round(repeatsAfter(b)))} spins`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
       }
     }
   }
