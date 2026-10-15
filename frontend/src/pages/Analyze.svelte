@@ -9,8 +9,10 @@
     type ModeBonusStats,
     type ModeTiers,
     type TierSpec,
+    type GameVersion,
   } from '../lib/api';
-  import { app, goTo, run, errorText } from '../lib/stores.svelte';
+  import type { GameMarket } from '../lib/market';
+  import { app, goTo, run, errorText, notify } from '../lib/stores.svelte';
   import { storageGetJson, storageSetJson } from '../lib/storage';
   import { fx, oneIn, refId, type ModePopulations, type PopRef } from '../lib/populations';
   import { allFindings, type Target } from '../lib/findings';
@@ -19,7 +21,6 @@
   import Compare from '../components/analyze/Compare.svelte';
   import Compliance from '../components/analyze/Compliance.svelte';
   import WinTiers from '../components/analyze/WinTiers.svelte';
-  import Fleet from '../components/analyze/Fleet.svelte';
   import Market from '../components/analyze/Market.svelte';
   import Mechanics from '../components/analyze/Mechanics.svelte';
   import SessionReach from '../components/analyze/SessionReach.svelte';
@@ -31,9 +32,10 @@
    *               bonus, tier, variant, criteria — distribution, not just averages);
    *   Compare     how do populations differ? (any of them, any mode, side by side);
    *   Mechanics   what do the events show the player? (every field, weighted by the LUT);
-   *   Compliance · Win tiers · Fleet — unchanged.
+   *   Market      where does each mode stand among the slots the market plays?
+   *   Compliance · Win tiers — unchanged.
    */
-  type View = 'overview' | 'explore' | 'mechanics' | 'compare' | 'compliance' | 'tiers' | 'fleet' | 'market';
+  type View = 'overview' | 'explore' | 'mechanics' | 'compare' | 'compliance' | 'tiers' | 'market';
 
   let stats = $state<{ mode: string; stats: ModeStats }[]>([]);
   let checks = $state<GameCheckReport | null>(null);
@@ -49,10 +51,24 @@
   let popsError = $state<string | null>(null);
   let bonusError = $state<string | null>(null);
   let tiersError = $state<string | null>(null);
+  let market = $state<GameMarket | null>(null);
+  let marketError = $state<string | null>(null);
+  let marketLoading = $state(false);
+  /** Which build the panels show; polled so a `run.py prod` shows up by itself. */
+  let version = $state<GameVersion | null>(null);
+  let reloading = $state(false);
   /** Stats and checks of the selected game on their way. */
   let loading = $state(false);
   let pinned = $state<PopRef[]>([]);
   let customThresholds = $state<number[]>([]);
+  /**
+   * 3★ grid: a rule (`strict`) or a reference with Stake's agreement to ship past it
+   * (`lenient` — Degen Lab, 2026-10-05). Defaults from the game's folder, kept per game.
+   */
+  let complianceChoice = $state<'strict' | 'lenient' | null>(null);
+  /** Degen Lab ships past the 3★ grid with Stake's agreement: its folder says so. */
+  const degenLab = $derived(/degen[-_ ]?lab/i.test(app.games.find((g) => g.name === app.selectedGame)?.publishDir ?? ''));
+  const compliance = $derived(complianceChoice ?? (degenLab ? 'lenient' : 'strict'));
   /** Populations and celebration ladders read (or failed): findings are complete. */
   let analysisReady = $state(false);
   let loadedGame = '';
@@ -67,16 +83,22 @@
   }
 
   function restore(game: string) {
-    const v = storageGetJson<{ pinned?: unknown; thresholds?: unknown }>(storageKey(game), {});
+    const v = storageGetJson<{ pinned?: unknown; thresholds?: unknown; compliance?: unknown }>(storageKey(game), {});
     pinned = Array.isArray(v?.pinned) ? (v.pinned as PopRef[]) : [];
     customThresholds = Array.isArray(v?.thresholds)
       ? v.thresholds.filter((x: unknown): x is number => typeof x === 'number')
       : [];
+    complianceChoice = v?.compliance === 'strict' || v?.compliance === 'lenient' ? v.compliance : null;
   }
 
   function persist() {
     if (!loadedGame) return;
-    storageSetJson(storageKey(loadedGame), { pinned, thresholds: customThresholds });
+    storageSetJson(storageKey(loadedGame), { pinned, thresholds: customThresholds, compliance: complianceChoice });
+  }
+
+  function toggleCompliance() {
+    complianceChoice = compliance === 'strict' ? 'lenient' : 'strict';
+    persist();
   }
 
   async function load(gameName: string) {
@@ -92,12 +114,14 @@
       pops = [];
       bonusStats = [];
       tiers = [];
-      popsError = bonusError = tiersError = null;
+      market = null;
+      version = null;
+      popsError = bonusError = tiersError = marketError = null;
     }
     loading = true;
     // Every source at once: they are independent, and chained they cost one
     // round trip each (the server runs them side by side).
-    const extras = Promise.all([loadPops(gameName), loadBonus(gameName), loadTiers(gameName)]);
+    const extras = Promise.all([loadPops(gameName), loadBonus(gameName), loadTiers(gameName), loadMarket(gameName)]);
     try {
       const [s, c] = await Promise.all([api.gameStats(gameName), api.gameChecks(gameName)]);
       if (gameName !== loadedGame) return;
@@ -145,6 +169,57 @@
     }
   }
 
+  async function loadMarket(gameName: string) {
+    marketLoading = true;
+    try {
+      const m = await api.market(gameName);
+      if (gameName !== loadedGame) return;
+      market = m;
+      marketError = null;
+    } catch (e) {
+      if (gameName !== loadedGame) return;
+      market = null;
+      marketError = errorText(e);
+    } finally {
+      if (gameName === loadedGame) marketLoading = false;
+    }
+  }
+
+  /**
+   * The build on screen vs the files on disk. SlotLab reloads a changed
+   * publish folder by itself (server watcher); here the page notices the new
+   * fingerprint and reads everything again — no hour spent on figures of a
+   * version already replaced (WILD CURRENT, 2026-10-05).
+   */
+  $effect(() => {
+    const game = app.selectedGame;
+    if (!game) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const v = await api.gameVersion(game);
+        if (stop || app.selectedGame !== game) return;
+        const previous = version;
+        version = v;
+        if (previous && previous.game === v.game && previous.fingerprint !== v.fingerprint && !reloading) {
+          reloading = true;
+          notify(`${game}: new math build read — refreshing the analysis`, 'info', 6000);
+          loadedGame = '';
+          await load(game);
+          reloading = false;
+        }
+      } catch {
+        /* the next tick retries */
+      }
+    };
+    void tick();
+    const id = setInterval(() => void tick(), 10_000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  });
+
   async function loadPops(gameName: string) {
     try {
       const p = (await api.populations(gameName, customThresholds)).modes;
@@ -173,7 +248,9 @@
 
   const current = $derived(stats.find((m) => m.mode === selectedMode)?.stats);
   /** Everything worth a look, over every source SlotLab has for the game. */
-  const issues = $derived(allFindings({ stats, checks, pops, tiers, popsError }));
+  const issues = $derived(allFindings({ stats, checks, pops, tiers, popsError, market, lenient: compliance === 'lenient' }));
+  const currentMarket = $derived(market?.modes.find((m) => m.mode === selectedMode));
+  const fmtTime = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
   const nBlocking = $derived(issues.filter((i) => i.severity === 'blocking').length);
   const nSerious = $derived(issues.filter((i) => i.severity === 'serious').length);
   const nMinor = $derived(issues.filter((i) => i.severity === 'minor').length);
@@ -232,6 +309,16 @@
     view = t.view;
   }
 
+  async function reloadNow() {
+    const game = app.selectedGame;
+    if (!game) return;
+    reloading = true;
+    await run(() => api.reloadGame(game), { error: 'Could not reload' });
+    loadedGame = '';
+    await load(game);
+    reloading = false;
+  }
+
   function togglePin(ref: PopRef) {
     const id = refId(ref);
     pinned = pinnedIds.has(id) ? pinned.filter((r) => refId(r) !== id) : [...pinned, ref];
@@ -282,7 +369,6 @@
     { id: 'compare', label: 'Compare' },
     { id: 'compliance', label: 'Compliance' },
     { id: 'tiers', label: 'Win tiers' },
-    { id: 'fleet', label: 'Fleet' },
     { id: 'market', label: 'Market' },
   ];
 
@@ -323,7 +409,23 @@
 {:else if !current}
   <div class="panel"><p class="dim">{app.selectedGame} has no mode with statistics.</p></div>
 {:else}
+  {#if version?.sourceChanged || reloading}
+    <div class="banner warn" role="status">
+      {#if reloading}
+        Reading the new math build…
+      {:else}
+        Math files changed on disk{#if version?.sourceMtime} at {fmtTime(version.sourceMtime)}{/if} — the figures below are those read
+        {#if version}at {fmtTime(version.loadedAt)}{/if}. SlotLab reloads them a few seconds after the publication ends.
+        <button class="ghost" onclick={reloadNow}>Reload now</button>
+      {/if}
+    </div>
+  {:else if version && !version.imported}
+    <div class="banner warn" role="status">
+      {version.importing ? 'Books importing — bonus findings appear when it ends.' : 'Books not imported for this build — bonus findings are missing. Games → Import books.'}
+    </div>
+  {/if}
   {#if popsError}<div class="banner error">Populations unavailable: {popsError}</div>{/if}
+  {#if marketError}<div class="banner warn">Market unavailable: {marketError}</div>{/if}
   {#if bonusError}<div class="banner warn">Bonus analysis unavailable: {bonusError}</div>{/if}
   {#if tiersError}<div class="banner warn">Win tiers unavailable: {tiersError}</div>{/if}
 
@@ -345,6 +447,14 @@
         {'★'.repeat(checks.starTier)}<span class="stars-off">{'☆'.repeat(3 - checks.starTier)}</span>
       </span>
       {#if checks.warnCount > 0}<span class="pill yellow">{checks.warnCount} warn</span>{/if}
+      <button
+        class="pill {compliance === 'strict' ? 'blue' : 'gold'} compliance"
+        title={compliance === 'strict' ? 'The 3★ grid is a rule for this game — click if Stake agreed this studio may ship past it (Degen Lab)' : 'Stake agreed this studio may ship past the 3★ grid: overruns are context, not faults — click to make the grid a rule again'}
+        aria-pressed={compliance === 'lenient'}
+        onclick={toggleCompliance}
+      >
+        {compliance === 'strict' ? '3★ required' : '3★ exceptions agreed'}
+      </button>
       {#if not2Star.length}
         <span class="tier-note" title="These constraints pass the 3★ limit but not the 2★ one — see Compliance">
           not eligible for 2★: {not2Star.join(', ')}
@@ -415,13 +525,13 @@
         </button>
       {/each}
     </div>
-    <span class="view-context faint">{view === 'compare' || view === 'fleet' || view === 'market' ? '' : selectedMode}</span>
+    <span class="view-context faint">{view === 'compare' ? '' : selectedMode}</span>
   </div>
 
   <div id="analyze-panel" role="tabpanel" aria-labelledby="analyze-tab-{view}">
     {#if view === 'overview'}
-      <SessionReach game={app.selectedGame ?? ''} mode={selectedMode} />
-      <Overview {stats} {checks} {pops} {selectedMode} {issues} ready={analysisReady} onSelectMode={(m) => (selectedMode = m)} onTarget={openTarget} />
+      <SessionReach game={app.selectedGame ?? ''} mode={selectedMode} market={currentMarket} />
+      <Overview {stats} {checks} {pops} {selectedMode} {issues} {market} ready={analysisReady} onSelectMode={(m) => (selectedMode = m)} onTarget={openTarget} />
     {:else if view === 'explore'}
       <section class="page">
         <Explore
@@ -459,11 +569,9 @@
       <Compliance {checks} {selectedMode} />
     {:else if view === 'tiers'}
       <WinTiers game={app.selectedGame ?? ''} {selectedMode} {tiers} {ladderSource} />
-    {:else if view === 'fleet'}
-      <Fleet />
     {:else if view === 'market'}
       <section class="page">
-        <Market game={app.selectedGame ?? ''} {selectedMode} />
+        <Market game={app.selectedGame ?? ''} {selectedMode} data={market} loading={marketLoading} error={marketError} onReload={() => app.selectedGame && loadMarket(app.selectedGame)} />
       </section>
     {/if}
   </div>
@@ -564,6 +672,10 @@
   .tier-note {
     font-size: var(--fs-xs);
     color: var(--text-dim);
+  }
+
+  .verdict-main .compliance {
+    font-size: var(--fs-2xs);
   }
 
   .verdict-meta {

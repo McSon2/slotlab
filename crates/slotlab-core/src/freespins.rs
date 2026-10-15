@@ -33,6 +33,21 @@
 //! quand même, une fois — la hausse qu'il provoque ensuite est son écho, pas
 //! un second retrigger.
 //!
+//! ── Le format « actions » (UNDEAD KING, front du client) ────────────────────
+//! Un événement n'y a pas de `type` : c'est une suite d'actions `{kind, data}`.
+//! `BonusGames` (data = free spins attribués) ouvre le bonus, `FreeSpinsWin` le
+//! clôt. Le palier est le nombre de symboles de déclenchement (`BONUS`,
+//! `SCATTER`) du dernier `GridSnapshot` avant `BonusGames` — le front le déduit
+//! de la même façon. Ce format ne connaît pas de retrigger.
+//!
+//! ── Les plateaux ────────────────────────────────────────────────────────────
+//! Les symboles des plateaux révélés (`reveal.board`, `GridSnapshot.cols`) sont
+//! comptés au passage, par nom : c'est ce que le joueur voit, low / high
+//! (`crate::symbols`). L'`anticipation` du PREMIER `reveal` (le spin payé) dit si
+//! les rouleaux ont ralenti pour le scatter manquant — ce que le joueur ressent
+//! comme un near miss quand aucun bonus ne suit (BUBBLE HEX, 2026-10-09 : la
+//! « Feature nearmiss » ne compte que les criteria forcés, la moitié du ressenti).
+//!
 //! ── Pourquoi un désérialiseur écrit à la main ───────────────────────────────
 //! L'import lit chaque book de fichiers qui dépassent plusieurs Go une fois
 //! décompressés. Un `serde_json::Value` par événement coûterait des milliers
@@ -43,7 +58,8 @@
 //! et sur un événement qui n'est pas `updateFreeSpin` il peut valoir autre
 //! chose qu'un nombre — ce qui ne doit jamais faire échouer un import.
 
-use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use crate::symbols::{SymbolMap, SymbolTally};
+use serde::de::{self, Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
@@ -52,6 +68,17 @@ const TRIGGER: &str = "freeSpinTrigger";
 const RETRIGGER: &str = "freeSpinRetrigger";
 const UPDATE: &str = "updateFreeSpin";
 const END: &str = "freeSpinEnd";
+const REVEAL: &str = "reveal";
+/// Format « actions » : ouverture du bonus (data = free spins attribués), fin
+/// du bonus, plateau révélé.
+const ACTION_BONUS: &str = "BonusGames";
+const ACTION_END: &str = "FreeSpinsWin";
+const ACTION_BOARD: &str = "GridSnapshot";
+
+/// Symbole qui déclenche un bonus dans le format « actions ».
+fn is_trigger_symbol(name: &str) -> bool {
+    name.eq_ignore_ascii_case("BONUS") || name.eq_ignore_ascii_case("SCATTER")
+}
 
 // ─── Ce qu'un événement annonce ─────────────────────────────────────────────
 
@@ -247,18 +274,72 @@ pub struct BookFs {
     /// Free spins du premier bonus au bout du compte, retriggers compris (plus
     /// haut total annoncé).
     pub spins_final: u32,
+    /// Symboles payants low / high des plateaux révélés, hors bonus et en free
+    /// spins (`crate::symbols`).
+    pub symbols: SymbolTally,
+    /// Le premier `reveal` (le spin payé) annonce le scatter manquant : au moins
+    /// un rouleau de son `anticipation` est non nul.
+    pub anticipation: bool,
 }
 
 pub fn summarize(events: &[FsEvent<'_>]) -> BookFs {
+    summarize_with(events, &SymbolMap::default())
+}
+
+/// `summarize`, les noms de symboles lus à travers `symbols` (la table du front
+/// d'un jeu qui ne nomme pas ses symboles `H*` / `L*`).
+pub fn summarize_with(events: &[FsEvent<'_>], symbols: &SymbolMap) -> BookFs {
     let mut out = BookFs::default();
     let mut counter = RetriggerCounter::default();
+    // Entre un déclenchement et la fin du bonus : les plateaux sans `gameType`
+    // (format « actions ») sont ceux des free spins.
+    let mut in_fs = false;
+    // Format « actions » : symboles de déclenchement du dernier plateau.
+    let mut last_triggers = 0u32;
+    let mut first_reveal = true;
     for ev in events {
         counter.push(&ev.typ, &ev.fs);
         if ev.typ.eq_ignore_ascii_case(TRIGGER) {
             if out.triggers == 0 {
-                out.tier = ev.positions.unwrap_or(0);
+                out.tier = ev.tier.or(ev.positions).unwrap_or(0);
             }
             out.triggers += 1;
+            in_fs = true;
+        } else if ev.typ.eq_ignore_ascii_case(END) {
+            in_fs = false;
+        } else if ev.typ.eq_ignore_ascii_case(REVEAL) {
+            if first_reveal {
+                out.anticipation = ev.anticipation;
+                first_reveal = false;
+            }
+            if let Some(board) = &ev.board {
+                let fs = ev.game_type.as_deref().map_or(in_fs, |g| g.eq_ignore_ascii_case("freegame"));
+                board.tally(symbols, fs, &mut out.symbols);
+            }
+        }
+        for a in &ev.actions {
+            match a.kind.as_ref() {
+                ACTION_BOARD => {
+                    if let Some(board) = &a.board {
+                        last_triggers = board.count(is_trigger_symbol);
+                        board.tally(symbols, in_fs, &mut out.symbols);
+                    }
+                }
+                ACTION_BONUS => {
+                    let announce = FsAnnounce { total_fs: a.number, ..Default::default() };
+                    counter.push(TRIGGER, &announce);
+                    if out.triggers == 0 {
+                        out.tier = last_triggers;
+                    }
+                    out.triggers += 1;
+                    in_fs = true;
+                }
+                ACTION_END => {
+                    counter.push(END, &FsAnnounce::default());
+                    in_fs = false;
+                }
+                _ => {}
+            }
         }
     }
     out.retriggers = counter.count();
@@ -283,6 +364,31 @@ pub struct FsEvent<'a> {
     /// Nombre d'éléments de `positions` quand l'événement en porte (sur un
     /// `freeSpinTrigger` : les symboles qui l'ont déclenché).
     pub positions: Option<u32>,
+    /// Palier EXPLICITE d'un `freeSpinTrigger` (`"tier": 4`) : un jeu à plusieurs
+    /// symboles de bonus déclenche des bonus DIFFÉRENTS avec le même nombre de
+    /// symboles (SAUCER PANIC, 2026-10-12 : 3 LAB EXPERIMENT = Bonus, 3 FULL
+    /// INVASION = Super) — compter les positions les confondait en « 3 scatters ».
+    /// Prioritaire sur `positions` quand il est présent.
+    pub tier: Option<u32>,
+    /// `gameType` du math-sdk (`basegame` / `freegame`) : à quelle partie du
+    /// round appartient le plateau d'un `reveal`.
+    pub game_type: Option<Cow<'a, str>>,
+    /// Les symboles de `board` — comptés sur un `reveal` seulement.
+    pub board: Option<BoardSyms<'a>>,
+    /// `anticipation` non nul (au moins un rouleau ralenti) — lu sur un `reveal`.
+    pub anticipation: bool,
+    /// Format « actions » : l'événement est une suite d'actions `{kind, data}`.
+    pub actions: Vec<FsAction<'a>>,
+}
+
+impl FsEvent<'_> {
+    /// Ce que l'événement montre, pour l'index de recherche : son `type`, puis
+    /// le `kind` de chacune de ses actions.
+    pub fn kinds(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.typ.as_ref())
+            .chain(self.actions.iter().map(|a| a.kind.as_ref()))
+            .filter(|k| !k.is_empty())
+    }
 }
 
 /// Un book réduit à ses événements.
@@ -295,6 +401,11 @@ pub struct FsBook<'a> {
 enum FsEventKey {
     Type,
     Positions,
+    Tier,
+    GameType,
+    Board,
+    Anticipation,
+    Actions,
     Fs(FsKey),
 }
 
@@ -310,6 +421,11 @@ impl<'de> Deserialize<'de> for FsEventKey {
                 Ok(match v {
                     "type" => FsEventKey::Type,
                     "positions" => FsEventKey::Positions,
+                    "tier" => FsEventKey::Tier,
+                    "gameType" => FsEventKey::GameType,
+                    "board" => FsEventKey::Board,
+                    "anticipation" => FsEventKey::Anticipation,
+                    "actions" => FsEventKey::Actions,
                     other => FsEventKey::Fs(FsKey::of(other)),
                 })
             }
@@ -338,6 +454,14 @@ impl<'de: 'a, 'a> Deserialize<'de> for FsEvent<'a> {
                             ev.positions = arr.len;
                             ev.fs.nested.extend(arr.found);
                         }
+                        FsEventKey::Tier => ev.tier = map.next_value::<OptCount>()?.0,
+                        FsEventKey::GameType => ev.game_type = map.next_value::<Cell<'a>>()?.0,
+                        FsEventKey::Board => {
+                            let board = map.next_value::<BoardSyms<'a>>()?;
+                            ev.board = (!board.0.is_empty()).then_some(board);
+                        }
+                        FsEventKey::Anticipation => ev.anticipation = map.next_value::<NonZero>()?.0,
+                        FsEventKey::Actions => ev.actions = map.next_value::<Actions<'a>>()?.0,
                         FsEventKey::Fs(k) => ev.fs.read(k, &mut map)?,
                     }
                 }
@@ -345,6 +469,102 @@ impl<'de: 'a, 'a> Deserialize<'de> for FsEvent<'a> {
             }
         }
         d.deserialize_map(V(PhantomData))
+    }
+}
+
+/// Un entier positif (`"tier": 4`) ; toute autre valeur — chaîne, objet, tableau,
+/// `null`, négatif — vaut `None` : un champ inattendu ne fait jamais échouer un import.
+struct OptCount(Option<u32>);
+
+impl<'de> Deserialize<'de> for OptCount {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptCount;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a count")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<OptCount, E> {
+                Ok(OptCount(u32::try_from(v).ok().filter(|&n| n > 0)))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<OptCount, E> {
+                Ok(OptCount(u32::try_from(v).ok().filter(|&n| n > 0)))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<OptCount, E> {
+                Ok(OptCount((v.fract() == 0.0 && v >= 1.0 && v <= u32::MAX as f64).then_some(v as u32)))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<OptCount, E> {
+                Ok(OptCount(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<OptCount, E> {
+                Ok(OptCount(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<OptCount, E> {
+                Ok(OptCount(None))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<OptCount, E> {
+                Ok(OptCount(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<OptCount, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptCount(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OptCount, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptCount(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Un nombre non nul, ou un tableau qui en contient un (`anticipation:
+/// [0, 0, 1, 1, 1]`). Toute autre valeur — chaîne, objet, `null` — vaut `false` :
+/// un champ inattendu ne doit jamais faire échouer un import.
+struct NonZero(bool);
+
+impl<'de> Deserialize<'de> for NonZero {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = NonZero;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a number or an array of numbers")
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<NonZero, E> {
+                Ok(NonZero(v))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<NonZero, E> {
+                Ok(NonZero(v != 0))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<NonZero, E> {
+                Ok(NonZero(v != 0))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<NonZero, E> {
+                Ok(NonZero(v != 0.0 && v.is_finite()))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<NonZero, E> {
+                Ok(NonZero(false))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<NonZero, E> {
+                Ok(NonZero(false))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<NonZero, E> {
+                Ok(NonZero(false))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<NonZero, A::Error> {
+                let mut any = false;
+                while let Some(NonZero(v)) = seq.next_element::<NonZero>()? {
+                    any |= v;
+                }
+                Ok(NonZero(any))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<NonZero, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(NonZero(false))
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 
@@ -549,6 +769,361 @@ fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
     Ok(())
 }
 
+// ─── Plateaux et actions ────────────────────────────────────────────────────
+
+/// Les scalaires autres que le texte ne portent rien.
+macro_rules! non_text_is_nothing {
+    ($nothing:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($nothing)
+        }
+    };
+}
+
+/// Les symboles d'un plateau, par nom, dans l'ordre d'apparition. Lu sans
+/// construire le plateau : un nom est emprunté à la ligne, et une case objet
+/// (`{"name": "H1", "wild": true}`) n'est lue que pour son `name`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoardSyms<'a>(pub Vec<(Cow<'a, str>, u16)>);
+
+impl<'a> BoardSyms<'a> {
+    fn add(&mut self, name: Cow<'a, str>) {
+        match self.0.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, c)) => *c = c.saturating_add(1),
+            None => self.0.push((name, 1)),
+        }
+    }
+
+    /// Cases dont le nom vérifie `pred`.
+    pub fn count(&self, pred: impl Fn(&str) -> bool) -> u32 {
+        self.0.iter().filter(|(n, _)| pred(n)).map(|&(_, c)| c as u32).sum()
+    }
+
+    fn tally(&self, symbols: &SymbolMap, free_spins: bool, out: &mut SymbolTally) {
+        for (name, n) in &self.0 {
+            if let Some(class) = symbols.classify(name) {
+                out.add(class, *n as u32, free_spins);
+            }
+        }
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for BoardSyms<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = BoardSyms<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            scalars_are_nothing!(BoardSyms::default());
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<BoardSyms<'a>, A::Error> {
+                let mut out = BoardSyms::default();
+                while seq.next_element_seed(Column(&mut out))?.is_some() {}
+                Ok(out)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<BoardSyms<'a>, A::Error> {
+                drain_map(map)?;
+                Ok(BoardSyms::default())
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// Un élément de plateau, versé dans le plateau en cours : une colonne
+/// (tableau de cases), ou une case seule d'un plateau à plat.
+struct Column<'b, 'a>(&'b mut BoardSyms<'a>);
+
+impl<'de: 'a, 'a> DeserializeSeed<'de> for Column<'_, 'a> {
+    type Value = ();
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de: 'a, 'a> Visitor<'de> for Column<'_, 'a> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a board column or cell")
+    }
+    non_text_is_nothing!(());
+    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<(), E> {
+        self.0.add(Cow::Borrowed(v));
+        Ok(())
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+        self.0.add(Cow::Owned(v.to_owned()));
+        Ok(())
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while let Some(cell) = seq.next_element::<Cell<'a>>()? {
+            if let Some(name) = cell.0 {
+                self.0.add(name);
+            }
+        }
+        Ok(())
+    }
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<(), A::Error> {
+        if let Some(name) = cell_name(map)? {
+            self.0.add(name);
+        }
+        Ok(())
+    }
+}
+
+/// Le `name` d'une case objet, le reste sauté.
+fn cell_name<'de: 'a, 'a, A: MapAccess<'de>>(mut map: A) -> Result<Option<Cow<'a, str>>, A::Error> {
+    let mut name = None;
+    while let Some(key) = map.next_key::<IsKey<NAME>>()? {
+        if key.0 {
+            name = map.next_value::<Cell<'a>>()?.0;
+        } else {
+            map.next_value::<IgnoredAny>()?;
+        }
+    }
+    Ok(name)
+}
+
+/// Un texte, ou rien : toute autre valeur se lit comme une absence. Sur une
+/// case de plateau, un objet se lit par son `name`.
+struct Cell<'a>(Option<Cow<'a, str>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for Cell<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = Cell<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a board cell")
+            }
+            non_text_is_nothing!(Cell(None));
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Cell<'a>, E> {
+                Ok(Cell(Some(Cow::Borrowed(v))))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Cell<'a>, E> {
+                Ok(Cell(Some(Cow::Owned(v.to_owned()))))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Cell<'a>, E> {
+                Ok(Cell(Some(Cow::Owned(v))))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Cell<'a>, A::Error> {
+                drain_seq(seq)?;
+                Ok(Cell(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Cell<'a>, A::Error> {
+                Ok(Cell(cell_name(map)?))
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+const NAME: u8 = 0;
+const BOARD: u8 = 1;
+
+/// Une clé d'objet : est-ce celle que `K` désigne ? (Lue sans allocation.)
+/// `NAME` : le nom d'une case ; `BOARD` : le plateau d'un `data` d'action
+/// (`cols`, `board`, `grid`).
+struct IsKey<const K: u8>(bool);
+
+impl<'de, const K: u8> Deserialize<'de> for IsKey<K> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<const K: u8>;
+        impl<'de, const K: u8> Visitor<'de> for V<K> {
+            type Value = IsKey<K>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a field name")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<IsKey<K>, E> {
+                Ok(IsKey(match K {
+                    NAME => v == "name",
+                    _ => matches!(v, "cols" | "board" | "grid"),
+                }))
+            }
+        }
+        d.deserialize_identifier(V::<K>)
+    }
+}
+
+/// Une action du format « actions » : son `kind`, et ce que son `data` porte
+/// d'utile — un nombre (`BonusGames` : free spins attribués) ou un plateau
+/// (`GridSnapshot.cols`). Le reste de `data` est sauté.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FsAction<'a> {
+    pub kind: Cow<'a, str>,
+    pub number: Option<f64>,
+    pub board: Option<BoardSyms<'a>>,
+}
+
+/// `actions` : un tableau d'actions, ou rien.
+struct Actions<'a>(Vec<FsAction<'a>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for Actions<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = Actions<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an array of actions")
+            }
+            scalars_are_nothing!(Actions(Vec::new()));
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Actions<'a>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(a) = seq.next_element::<Action<'a>>()? {
+                    out.extend(a.0);
+                }
+                Ok(Actions(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Actions<'a>, A::Error> {
+                drain_map(map)?;
+                Ok(Actions(Vec::new()))
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// Un élément de `actions` : une action si c'est un objet, rien sinon.
+struct Action<'a>(Option<FsAction<'a>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for Action<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = Action<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an action")
+            }
+            scalars_are_nothing!(Action(None));
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Action<'a>, A::Error> {
+                drain_seq(seq)?;
+                Ok(Action(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Action<'a>, A::Error> {
+                let mut out = FsAction::default();
+                while let Some(key) = map.next_key::<ActionKey>()? {
+                    match key {
+                        ActionKey::Kind => out.kind = map.next_value::<Cell<'a>>()?.0.unwrap_or_default(),
+                        ActionKey::Data => {
+                            let data = map.next_value::<ActionData<'a>>()?;
+                            out.number = data.number;
+                            out.board = data.board;
+                        }
+                        ActionKey::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(Action(Some(out)))
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+enum ActionKey {
+    Kind,
+    Data,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ActionKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ActionKey;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an action field name")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ActionKey, E> {
+                Ok(match v {
+                    "kind" => ActionKey::Kind,
+                    "data" => ActionKey::Data,
+                    _ => ActionKey::Other,
+                })
+            }
+        }
+        d.deserialize_identifier(V)
+    }
+}
+
+/// Le `data` d'une action : un nombre, ou un objet qui porte un plateau.
+#[derive(Default)]
+struct ActionData<'a> {
+    number: Option<f64>,
+    board: Option<BoardSyms<'a>>,
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for ActionData<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = ActionData<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("action data")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ActionData<'a>, E> {
+                Ok(ActionData { number: Some(v as f64), board: None })
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ActionData<'a>, E> {
+                Ok(ActionData { number: Some(v as f64), board: None })
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<ActionData<'a>, E> {
+                Ok(ActionData { number: v.is_finite().then_some(v), board: None })
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<ActionData<'a>, E> {
+                Ok(ActionData::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<ActionData<'a>, E> {
+                Ok(ActionData::default())
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<ActionData<'a>, E> {
+                Ok(ActionData::default())
+            }
+            fn visit_none<E: de::Error>(self) -> Result<ActionData<'a>, E> {
+                Ok(ActionData::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<ActionData<'a>, A::Error> {
+                drain_seq(seq)?;
+                Ok(ActionData::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ActionData<'a>, A::Error> {
+                let mut out = ActionData::default();
+                while let Some(key) = map.next_key::<IsKey<BOARD>>()? {
+                    if key.0 {
+                        // `GridSnapshot` porte `"board": 0` puis `"cols": [[…]]` :
+                        // seul un vrai plateau est retenu.
+                        let board = map.next_value::<BoardSyms<'a>>()?;
+                        if !board.0.is_empty() {
+                            out.board = Some(board);
+                        }
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +1271,22 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_tier_beats_the_positions() {
+        // SAUCER PANIC : 3 FULL INVASION = le Super (palier 4), 3 LAB EXPERIMENT = le Bonus (palier 3)
+        let tier_of = |trigger: &str| {
+            let line = book(&[trigger, r#"{"type":"freeSpinEnd","amount":10}"#].join(","));
+            let parsed: FsBook = serde_json::from_str(&line).unwrap();
+            summarize(&parsed.events).tier
+        };
+        let pos = r#""positions":[{"reel":0,"row":1},{"reel":2,"row":3},{"reel":4,"row":2}]"#;
+        assert_eq!(tier_of(&format!(r#"{{"type":"freeSpinTrigger","totalFs":10,{pos},"tier":4}}"#)), 4);
+        assert_eq!(tier_of(&format!(r#"{{"type":"freeSpinTrigger","totalFs":10,"tier":3,{pos}}}"#)), 3);
+        // un palier illisible ne casse rien : les positions comptent
+        assert_eq!(tier_of(&format!(r#"{{"type":"freeSpinTrigger","totalFs":10,{pos},"tier":"super"}}"#)), 3);
+        assert_eq!(tier_of(&format!(r#"{{"type":"freeSpinTrigger","totalFs":10,{pos},"tier":null}}"#)), 3);
+    }
+
+    #[test]
     fn tier_is_the_first_trigger_positions() {
         // Palier = positions du PREMIER déclenchement : un second déclenchement
         // ne le change pas, et le criteria (ici un wincap) n'y entre pour rien.
@@ -713,17 +1304,21 @@ mod tests {
         // déclenchement à 10 n'y entre pas.
         assert_eq!(
             summarize(&parsed.events),
-            BookFs { triggers: 2, tier: 3, retriggers: 1, spins_initial: 6, spins_final: 7 }
+            BookFs { triggers: 2, tier: 3, retriggers: 1, spins_initial: 6, spins_final: 7, ..Default::default() }
         );
-        // Sans déclenchement : palier 0. Déclenchement sans positions : 0 aussi.
+        // Sans déclenchement : palier 0 (le plateau du `reveal` est compté :
+        // un H1 et un L1 en free spins). Déclenchement sans positions : 0 aussi.
         let none_line = book(REVEAL);
         let none: FsBook = serde_json::from_str(&none_line).unwrap();
-        assert_eq!(summarize(&none.events), BookFs::default());
+        assert_eq!(
+            summarize(&none.events),
+            BookFs { symbols: SymbolTally { low_fs: 1, high_fs: 1, ..Default::default() }, ..Default::default() }
+        );
         let bare_line = book(r#"{"type":"freeSpinTrigger","totalFs":8}"#);
         let bare: FsBook = serde_json::from_str(&bare_line).unwrap();
         assert_eq!(
             summarize(&bare.events),
-            BookFs { triggers: 1, tier: 0, retriggers: 0, spins_initial: 8, spins_final: 8 }
+            BookFs { triggers: 1, tier: 0, retriggers: 0, spins_initial: 8, spins_final: 8, ..Default::default() }
         );
     }
 
@@ -752,5 +1347,112 @@ mod tests {
         assert_eq!(types, ["reveal", "freeSpinTrigger"]);
         assert!(matches!(parsed.events[0].typ, Cow::Borrowed(_)));
         assert_eq!(parsed.events[1].fs.total_fs, Some(6.0));
+    }
+
+    // ── Format « actions » (UNDEAD KING) ──
+
+    /// Plateau d'entrée : 4 BONUS, lows P2 P1 P1 P1 P5, highs P9 P6 P7.
+    const SNAP_4: &str = r#"{"index":0,"win":0,"actions":[{"kind":"Haywire"},{"kind":"GridSnapshot","data":{"board":0,"progressiveBarValue":0,
+        "cols":[["BONUS","P9","P2"],["P6","BONUS","P1"],["P1","P1","BONUS"],["BONUS","P7","P5"]]}}]}"#;
+    /// Free spin : highs P9 P8, low P1 (le Wild n'est ni l'un ni l'autre).
+    const FS_SPIN: &str = r#"{"index":2,"win":0,"actions":[{"kind":"GridSnapshot","data":{"board":0,"cols":[["P9","WILD3"],["P8","P1"]]}},
+        {"kind":"WildJump","data":{"from_panel":[0,1],"to_panel":[1,1]}}]}"#;
+    const FS_LINES: &str = r#"{"index":3,"win":1.5,"actions":[{"kind":"LinesHit","data":{"line":1,"streak":3,"panels":[[0,0],[0,1],[0,2]],"symbol":"P9"}}]}"#;
+
+    fn front_map() -> SymbolMap {
+        SymbolMap::from_front_config(
+            br#"{"math":{"symbols":{"P1":"L5","P2":"L4","P3":"L3","P4":"L2","P5":"L1","P6":"H4","P7":"H3","P8":"H2","P9":"H1"}}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn actions_book_takes_its_tier_from_the_board_before_bonusgames() {
+        let line = book(
+            &[
+                SNAP_4,
+                r#"{"index":1,"win":0,"actions":[{"kind":"BonusGames","data":10}]}"#,
+                FS_SPIN,
+                FS_LINES,
+                r#"{"index":4,"win":0,"actions":[{"kind":"FreeSpinsWin","data":{"win":15}}]}"#,
+            ]
+            .join(","),
+        );
+        let parsed: FsBook = serde_json::from_str(&line).unwrap();
+        let fs = summarize_with(&parsed.events, &front_map());
+        assert_eq!(
+            fs,
+            BookFs {
+                triggers: 1,
+                tier: 4,
+                retriggers: 0,
+                spins_initial: 10,
+                spins_final: 10,
+                symbols: SymbolTally { low: 5, high: 3, low_fs: 1, high_fs: 2 },
+                // le format « actions » ne dit pas d'anticipation
+                anticipation: false,
+            }
+        );
+        // Sans la table du front, `P1`…`P9` ne se classent pas : rien compté.
+        assert_eq!(summarize(&parsed.events).symbols, SymbolTally::default());
+        // Les actions entrent dans l'index de recherche comme des types.
+        let kinds: Vec<&str> = parsed.events[0].kinds().collect();
+        assert_eq!(kinds, ["Haywire", "GridSnapshot"]);
+        assert!(matches!(parsed.events[0].actions[1].kind, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn actions_book_without_bonusgames_is_no_bonus() {
+        // Mystery « no bonus » : un plateau à 2 BONUS, rien d'autre.
+        let snap_2 = SNAP_4.replacen("\"BONUS\"", "\"P3\"", 2);
+        let line = book(&snap_2);
+        let parsed: FsBook = serde_json::from_str(&line).unwrap();
+        let fs = summarize_with(&parsed.events, &front_map());
+        assert_eq!((fs.triggers, fs.tier, fs.spins_initial), (0, 0, 0));
+        assert_eq!(fs.symbols, SymbolTally { low: 7, high: 3, ..Default::default() });
+    }
+
+    #[test]
+    fn sdk_boards_count_by_game_type_and_odd_boards_never_break() {
+        let events = [
+            r#"{"type":"reveal","gameType":"basegame","board":[[{"name":"H2"},{"name":"H2","wild":false}],[{"multiplier":2,"name":"L3"}]]}"#,
+            // Plateau d'un autre événement que `reveal` : pas compté.
+            r#"{"type":"tumbleBoard","board":[[{"name":"H1"}]]}"#,
+            // Formes inattendues : un nombre, un objet, un plateau à plat.
+            r#"{"type":"reveal","board":0}"#,
+            r#"{"type":"reveal","board":{"x":1}}"#,
+            r#"{"type":"reveal","board":["H1","L1",{"name":"L2"},7,null]}"#,
+            REVEAL,
+        ]
+        .join(",");
+        let line = book(&events);
+        let parsed: FsBook = serde_json::from_str(&line).unwrap();
+        // Base : H2 H2 L3, puis le plateau à plat (sans `gameType`, hors bonus) H1 L1 L2.
+        // Free spins : H1 et L1 de `REVEAL` (`gameType` freegame).
+        assert_eq!(summarize(&parsed.events).symbols, SymbolTally { low: 3, high: 3, low_fs: 1, high_fs: 1 });
+    }
+
+    #[test]
+    fn anticipation_is_the_paid_spin_one() {
+        let antic = |events: &[&str]| {
+            let line = book(&events.join(","));
+            let parsed: FsBook = serde_json::from_str(&line).unwrap();
+            summarize(&parsed.events).anticipation
+        };
+        // Le spin payé ralentit les rouleaux 4 et 5 ; le reveal suivant ne compte pas.
+        assert!(antic(&[
+            r#"{"type":"reveal","gameType":"basegame","anticipation":[0,0,0,1,1]}"#,
+            r#"{"type":"reveal","gameType":"freegame","anticipation":[0,0,0,0,0]}"#,
+        ]));
+        // Une anticipation en free spins seulement n'est pas celle du spin payé.
+        assert!(!antic(&[
+            r#"{"type":"reveal","gameType":"basegame","anticipation":[0,0,0,0,0]}"#,
+            r#"{"type":"reveal","gameType":"freegame","anticipation":[0,1,1,1,1]}"#,
+        ]));
+        // Formes inattendues : jamais d'échec d'import.
+        assert!(!antic(&[r#"{"type":"reveal","anticipation":"yes"}"#]));
+        assert!(!antic(&[r#"{"type":"reveal","anticipation":{"reel":3}}"#]));
+        assert!(antic(&[r#"{"type":"reveal","anticipation":[[0],[2]]}"#]));
+        assert!(!antic(&[r#"{"type":"reveal"}"#]));
     }
 }

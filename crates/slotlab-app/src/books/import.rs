@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use slotlab_core::freespins::{summarize, FsEvent};
+use slotlab_core::freespins::{summarize_with, FsEvent};
+use slotlab_core::symbols::SymbolMap;
 use slotlab_core::mechanics::{scan_book_with, MechIndex, MAX_VALUES};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,10 +30,11 @@ pub struct ImportProgress {
 
 /// Minimal fields extracted from each book for the search index.
 ///
-/// Les événements sont lus par `FsEvent` : leur type (bits d'événements,
-/// `fs_triggers`), les annonces de total de free spins (`fs_retriggers`) et
-/// la longueur de `positions` (`fs_tier`), tout le reste sauté sans être
-/// construit — le type est même emprunté à la ligne au lieu d'être copié.
+/// Les événements sont lus par `FsEvent` : leur type ou leurs actions (bits
+/// d'événements, `fs_triggers`), les annonces de total de free spins
+/// (`fs_retriggers`), la longueur de `positions` (`fs_tier`) et les symboles
+/// des plateaux révélés (`sym_*`), tout le reste sauté sans être construit —
+/// le type est même emprunté à la ligne au lieu d'être copié.
 #[derive(Deserialize)]
 struct BookMetaRaw<'a> {
     id: u64,
@@ -143,6 +145,10 @@ struct LocalRecord {
     fs_spins_initial: u16,
     fs_spins_final: u16,
     fg_win_x100: Option<u64>,
+    /// Symboles low / high : base, base, free spins, free spins.
+    sym: [u16; 4],
+    /// Anticipation du spin payé.
+    antic: bool,
     /// Occurrences (valeur locale, nombre) des mécaniques du book.
     mech: Vec<(u32, u16)>,
 }
@@ -156,7 +162,7 @@ struct Chunk {
 }
 
 /// Parses + compresses a chunk of lines (runs on the rayon pool).
-fn process_chunk(chunk: &Chunk, mode_name: &str) -> Result<ChunkOut> {
+fn process_chunk(chunk: &Chunk, mode_name: &str, symbols: &SymbolMap) -> Result<ChunkOut> {
     let mut records = Vec::with_capacity(chunk.lines.len());
     let mut criteria_local: Vec<String> = Vec::new();
     let mut event_types_local: Vec<String> = Vec::new();
@@ -181,16 +187,13 @@ fn process_chunk(chunk: &Chunk, mode_name: &str) -> Result<ChunkOut> {
 
         // Déclenchements, palier et retriggers sur TOUS les événements — la
         // boucle des bits ci-dessous saute ceux au-delà du 64e type.
-        let fs = summarize(&meta.events);
+        let fs = summarize_with(&meta.events, symbols);
         let mut event_bits: u64 = 0;
-        for ev in &meta.events {
-            if ev.typ.is_empty() {
-                continue;
-            }
-            let bit = match event_types_local.iter().position(|n| *n == ev.typ) {
+        for kind in meta.events.iter().flat_map(|ev| ev.kinds()) {
+            let bit = match event_types_local.iter().position(|n| n == kind) {
                 Some(i) => i,
                 None if event_types_local.len() < 64 => {
-                    event_types_local.push(ev.typ.to_string());
+                    event_types_local.push(kind.to_string());
                     event_types_local.len() - 1
                 }
                 None => continue,
@@ -233,6 +236,9 @@ fn process_chunk(chunk: &Chunk, mode_name: &str) -> Result<ChunkOut> {
                 .free_game_wins
                 .filter(|v| v.is_finite())
                 .map(|v| (v * 100.0).round().max(0.0) as u64),
+            sym: [fs.symbols.low, fs.symbols.high, fs.symbols.low_fs, fs.symbols.high_fs]
+                .map(|n| n.min(u16::MAX as u32) as u16),
+            antic: fs.anticipation,
             mech: mech_book,
         });
     }
@@ -261,13 +267,16 @@ fn intern(global: &mut Vec<String>, name: &str) -> usize {
 /// Imports `books_<MODE>.jsonl.zst` → `<cache>/books_<MODE>.blocks` + `.idx`.
 /// Pipeline: sequential zstd decoding (the source stream is single-frame) →
 /// waves of chunks parsed + re-compressed IN PARALLEL (rayon) → ordered
-/// write. JSON parsing, the dominant cost, uses all cores.
+/// write. JSON parsing, the dominant cost, uses all cores. `symbols`: how
+/// the game names its low / high symbols (`SymbolMap::default()` for the
+/// math-sdk's `H*` / `L*`).
 pub fn import_mode(
     source: &Path,
     cache_dir: &Path,
     mode_name: &str,
     source_fingerprint: u64,
     progress: Arc<ImportProgress>,
+    symbols: &SymbolMap,
 ) -> Result<ModeBookIndex> {
     std::fs::create_dir_all(cache_dir)?;
     let file =
@@ -354,7 +363,7 @@ pub fn import_mode(
                 // Parse + compression in parallel, order preserved by collect.
                 let outs: Vec<Result<ChunkOut>> = batch
                     .par_iter()
-                    .map(|chunk| process_chunk(chunk, mode_name))
+                    .map(|chunk| process_chunk(chunk, mode_name, symbols))
                     .collect();
 
                 // Ordered write + merge of local tables → global.
@@ -432,6 +441,11 @@ pub fn import_mode(
                             fs_spins_initial: r.fs_spins_initial,
                             fs_spins_final: r.fs_spins_final,
                             fg_win_x100: r.fg_win_x100,
+                            sym_low: r.sym[0],
+                            sym_high: r.sym[1],
+                            sym_low_fs: r.sym[2],
+                            sym_high_fs: r.sym[3],
+                            antic: r.antic,
                         });
                         mech_books.push(
                             r.mech
@@ -548,7 +562,7 @@ mod tests {
         let src = dir.join("books_BASE.jsonl.zst");
         std::fs::write(&src, zstd::bulk::compress(jsonl.as_bytes(), 3).unwrap()).unwrap();
         let index =
-            import_mode(&src, &dir, "BASE", 42, Arc::new(ImportProgress::default())).unwrap();
+            import_mode(&src, &dir, "BASE", 42, Arc::new(ImportProgress::default()), &SymbolMap::default()).unwrap();
 
         let got = |idx: &ModeBookIndex| -> Vec<(u64, u16, u16, u8)> {
             idx.books
@@ -591,10 +605,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Importe un vrai fichier de books et affiche ses retriggers :
+    /// Importe un vrai fichier de books et affiche ses retriggers, ses paliers
+    /// et ses symboles low / high :
     /// `BOOKS=…/books_BONUS.jsonl.zst cargo test -p slotlab-app --release real_books
-    /// -- --ignored --nocapture`. Le cache est écrit sous `IMPORT_OUT` (sinon le
-    /// dossier temporaire du système), puis supprimé.
+    /// -- --ignored --nocapture`. `FRONT=<build du front>` lit les noms de
+    /// symboles à travers sa table (`registry::front_symbols`). Le cache est
+    /// écrit sous `IMPORT_OUT` (sinon le dossier temporaire du système), puis
+    /// supprimé.
     #[test]
     #[ignore]
     fn real_books() {
@@ -605,8 +622,9 @@ mod tests {
             .join(format!("slotlab-real-import-{}", std::process::id()));
         std::fs::create_dir_all(&out).unwrap();
         let t = std::time::Instant::now();
-        let index =
-            import_mode(&src, &out, "REAL", 0, Arc::new(ImportProgress::default())).unwrap();
+        let front = std::env::var("FRONT").ok().map(std::path::PathBuf::from);
+        let symbols = crate::registry::front_symbols(front.as_deref());
+        let index = import_mode(&src, &out, "REAL", 0, Arc::new(ImportProgress::default()), &symbols).unwrap();
         println!(
             "{} books importés en {:.1} s",
             index.books.len(),
@@ -623,6 +641,16 @@ mod tests {
             *dist.entry(b.fs_retriggers).or_default() += 1;
         }
         println!("retriggers → books : {dist:?}");
+        let mut tiers = std::collections::BTreeMap::<u8, u64>::new();
+        let mut sym = [0u64; 4];
+        for b in &index.books {
+            *tiers.entry(b.fs_tier).or_default() += 1;
+            for (s, n) in sym.iter_mut().zip([b.sym_low, b.sym_high, b.sym_low_fs, b.sym_high_fs]) {
+                *s += n as u64;
+            }
+        }
+        println!("paliers → books : {tiers:?}");
+        println!("symboles (books bruts) : base {} low / {} high · free spins {} low / {} high", sym[0], sym[1], sym[2], sym[3]);
         std::fs::remove_dir_all(&out).ok();
     }
 }

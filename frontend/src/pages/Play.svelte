@@ -78,6 +78,11 @@
   let balance = $state(saved.balance ?? 10000);
   let scalePct = $state(saved.scalePct ?? 60);
   let customViewports = $state<ViewportPreset[]>(saved.customViewports ?? []);
+  /** Game clock rate, for watching a spin frame by frame. Deliberately not
+   * saved: a session that opens slowed down would pass for a broken game. */
+  const SPEEDS = [0, 0.05, 0.1, 0.25, 0.5, 1, 2];
+  let speedIdx = $state(SPEEDS.indexOf(1));
+  const speed = $derived(SPEEDS[speedIdx]);
   let customW = $state<number | null>(null);
   let customH = $state<number | null>(null);
 
@@ -796,6 +801,27 @@
         />
         <button type="submit" class="ghost" disabled={!customValid}>+ custom</button>
       </form>
+      <label
+        class="zoom"
+        title={customUrl
+          ? 'Only on the build served by SlotLab (the custom URL is not instrumented)'
+          : 'Slows the game clocks: animations, timers, Spine, tweens. Audio keeps its pace.'}
+      >
+        <span>
+          Speed {speed === 0 ? 'paused' : `×${speed}`}
+          {#if speed !== 1}
+            <button type="button" class="ghost reset" onclick={() => (speedIdx = SPEEDS.indexOf(1))}>×1</button>
+          {/if}
+        </span>
+        <input
+          type="range"
+          min="0"
+          max={SPEEDS.length - 1}
+          step="1"
+          bind:value={speedIdx}
+          disabled={Boolean(customUrl)}
+        />
+      </label>
       <label class="zoom">
         <span>Zoom {scalePct}%</span>
         <input type="range" min="25" max="100" step="5" bind:value={scalePct} />
@@ -981,6 +1007,7 @@
           height={v.height}
           label={v.label}
           scale={scalePct / 100}
+          {speed}
         />
       {/each}
     </div>
@@ -1182,6 +1209,13 @@
     gap: 5px;
     margin: 0;
     color: var(--text-faint);
+  }
+
+  .zoom .reset {
+    padding: 0 4px;
+    margin-left: 4px;
+    font-size: var(--fs-xs);
+    height: auto;
   }
 
   .zoom input[type='range'] {

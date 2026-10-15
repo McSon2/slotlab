@@ -11,7 +11,13 @@ pub const IDX_MAGIC: &[u8; 8] = b"SLBIDX01";
 ///   4 → 5 : relevé des mécaniques `books_<MODE>.mech` (`MechFile`), écrit avec
 ///           l'index — le passage à 5 force le ré-import qui le produit.
 ///   5 → 6 : mécaniques croisées par sorte (`champ@sorte`, cf. `mechanics`).
-pub const IDX_VERSION: u32 = 6;
+///   6 → 7 : symboles low / high révélés (`sym_*`, `slotlab_core::symbols`) et
+///           format « actions » (UNDEAD KING : paliers lus sur `BonusGames`).
+///   7 → 8 : `antic`, l'anticipation du spin payé (premier `reveal`).
+///   8 → 9 : `fs_tier` pris sur le champ `tier` du premier `freeSpinTrigger` quand
+///           le jeu le donne (SAUCER PANIC : 3 = LAB, 4 = FULL INVASION, tous deux
+///           déclenchés par 3 symboles) ; sinon toujours ses `positions`.
+pub const IDX_VERSION: u32 = 9;
 
 pub const MECH_MAGIC: &[u8; 8] = b"SLBMECH1";
 
@@ -93,6 +99,16 @@ pub struct BookRecord {
     /// spin de base qui l'a ouvert. `None` : le book ne le dit pas (champ
     /// propre aux books du math-sdk).
     pub fg_win_x100: Option<u64>,
+    /// Symboles payants low / high des plateaux révélés, hors bonus puis en
+    /// free spins (`slotlab_core::symbols`) ; 0 : noms non classés ou books
+    /// sans plateau.
+    pub sym_low: u16,
+    pub sym_high: u16,
+    pub sym_low_fs: u16,
+    pub sym_high_fs: u16,
+    /// Le spin payé annonce le scatter manquant : `anticipation` non nul sur
+    /// le premier `reveal` (`slotlab_core::freespins`).
+    pub antic: bool,
 }
 
 /// Sidecar `books_<MODE>.idx`: everything needed to read and search

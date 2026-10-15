@@ -131,11 +131,41 @@ export interface RoundAmounts {
   topShare: number;
 }
 
+/** Paying symbols revealed per round, weighted by the lookup table. */
+export interface SymbolMix {
+  low: number;
+  high: number;
+}
+
+/** What the player sees of the paying symbols: outside the bonus, then in the free spins. */
+export interface SymbolsSeen {
+  base: SymbolMix;
+  freeSpins: SymbolMix;
+}
+
+/**
+ * Reels slowing down for the missing scatter on the paid spin (the books' first
+ * `reveal.anticipation`), as shares of the rounds, weighted by the lookup table.
+ * BUBBLE HEX 2026-10-09: the « nearmiss » feature line only counts the criteria that
+ * FORCE two scatters — ordinary spins that land them anticipate too.
+ */
+export interface AnticipationSeen {
+  all: number;
+  /** Anticipation and no bonus: the near miss the player feels, forced or natural. */
+  withoutBonus: number;
+  /** Share of the bonus rounds announced by an anticipation; null without bonuses. */
+  bonusAnnounced: number | null;
+}
+
 export interface ModePopulations {
   mode: string;
   cost: number;
   imported: boolean;
   populations: Population[];
+  /** Null: no readable board in the books, or symbol names neither H* / L* nor mapped by the front. */
+  symbols?: SymbolsSeen | null;
+  /** Null: no book of the mode anticipates (or its format does not say). */
+  anticipation?: AnticipationSeen | null;
 }
 
 /** A population anywhere in the game: what Compare pins. */
@@ -189,6 +219,27 @@ export function threshold(p: Population, x: number): Threshold | undefined {
 
 export function quantile(p: Population, q: number): Quantile | undefined {
   return p.quantiles.find((v) => Math.abs(v.q - q) < 1e-9);
+}
+
+/**
+ * P(win < x) read on the population's CDF (1-1.5-2-3-5-7 per decade), exact on
+ * a grid point, interpolated in log x between two — for a threshold the grid
+ * does not hold (a tenth of a bonus average).
+ */
+export function cdfBelow(p: Population, x: number): number {
+  const t = p.thresholds.find((v) => Math.abs(v.x - x) < 1e-9);
+  if (t) return t.below;
+  const pts = p.cdf;
+  if (!pts.length) return 0;
+  if (x <= pts[0].x) return x <= 0 ? 0 : pts[0].below * (x / pts[0].x);
+  if (x >= pts[pts.length - 1].x) return pts[pts.length - 1].below;
+  let i = 1;
+  while (i < pts.length && pts[i].x < x) i++;
+  const a = pts[i - 1];
+  const b = pts[i];
+  if (Math.abs(b.x - a.x) < 1e-12) return b.below;
+  const u = (Math.log(x) - Math.log(a.x)) / (Math.log(b.x) - Math.log(a.x));
+  return a.below + (b.below - a.below) * u;
 }
 
 // ── Tree ─────────────────────────────────────────────────────────────────────
@@ -289,9 +340,14 @@ export function populationFindings(p: Population, cost: number): Finding[] {
     });
   }
   if (p.top1Share >= 0.2) {
+    // A whole base game lives on its top 1 % (market base games: 72–82 %, median 77 %);
+    // only a bonus or a buy is skewed at 40 %.
+    const whole = p.kind === 'all' || p.kind === 'nobonus';
     out.push({
-      level: p.top1Share >= 0.4 ? 'warn' : 'info',
-      text: `The top 1 % carries ${pct(p.top1Share)} of the value; without it the average would be ${fx(p.meanWithoutTop1)}.`,
+      level: p.top1Share >= (whole ? 0.85 : 0.4) ? 'warn' : 'info',
+      text:
+        `The top 1 % carries ${pct(p.top1Share)} of the value; without it the average would be ${fx(p.meanWithoutTop1)}.` +
+        (whole && cost < 10 ? ' Market base games: 72–82 % (median 77 %) — see Market for the peers of this mode.' : ''),
     });
   }
   const unders = STEPS.map((x) => threshold(p, x)).filter((t): t is Threshold => !!t && t.below > 0 && t.below < 1);

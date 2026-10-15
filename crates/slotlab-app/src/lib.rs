@@ -108,6 +108,9 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
     // day from the 30-day ranking (`market_refresh`).
     market_refresh::start();
 
+    // A `run.py prod` that lands while SlotLab runs is read again by itself.
+    tokio::spawn(watch_sources(state.clone()));
+
     // Background auto-import at startup: all games whose books cache is
     // missing or stale (fingerprint), one at a time.
     {
@@ -171,6 +174,37 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
     tracing::info!("SlotLab UI: http://localhost:{}", opts.port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Reloads a game as soon as its publish files change on disk (and stop
+/// changing: a publication writes several files one after the other, so a
+/// file is only taken once it has been still for a few seconds). Nothing to
+/// click after a `run.py prod`, and no hour spent on figures of a version
+/// already replaced (WILD CURRENT, 2026-10-05).
+async fn watch_sources(state: AppState) {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(8);
+    loop {
+        tokio::time::sleep(EVERY).await;
+        for entry in state.registry.list_entries() {
+            let Some(game) = state.registry.get(&entry.name) else {
+                continue;
+            };
+            let Some(mtime) = game.source_mtime() else {
+                continue;
+            };
+            if mtime <= game.loaded_at {
+                continue;
+            }
+            if std::time::SystemTime::now().duration_since(mtime).map_or(true, |age| age < SETTLE) {
+                continue;
+            }
+            tracing::info!("math changed on disk: reloading {}", entry.name);
+            if let Err(e) = api::routes::reload_and_import(&state, &entry.name).await {
+                tracing::warn!("reload of {} failed: {:?}", entry.name, e);
+            }
+        }
+    }
 }
 
 /// Options of the public multi-game server.
@@ -295,6 +329,11 @@ fn games_router() -> Router<AppState> {
         match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 let mime = mime_guess::from_path(&path).first_or_octet_stream();
+                let bytes = if mime.essence_str() == "text/html" {
+                    inject_time_warp(bytes)
+                } else {
+                    bytes
+                };
                 ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
             }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -325,6 +364,28 @@ fn games_router() -> Router<AppState> {
                 },
             ),
         )
+}
+
+/// The Play tab's speed control: a script that puts the page's clocks on a
+/// virtual one, injected first thing in the <head> so the game captures the
+/// patched functions. Only here — the shared link serves the build untouched.
+fn inject_time_warp(html: Vec<u8>) -> Vec<u8> {
+    const SCRIPT: &str = include_str!("timewarp.js");
+    let tag = format!("<script>{SCRIPT}</script>");
+    let text = match String::from_utf8(html) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    let at = text
+        .to_ascii_lowercase()
+        .find("<head")
+        .and_then(|i| text[i..].find('>').map(|j| i + j + 1))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(text.len() + tag.len());
+    out.push_str(&text[..at]);
+    out.push_str(&tag);
+    out.push_str(&text[at..]);
+    out.into_bytes()
 }
 
 /// Embedded UI (release, embed-ui feature) or a pointer message (dev).

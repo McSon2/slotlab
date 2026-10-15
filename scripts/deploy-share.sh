@@ -22,9 +22,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-HOST=${SLOTLAB_DEPLOY_HOST:-root@192.168.1.181}
-REMOTE=/media/usb-disk/slotlab/games     # = /mnt/storage/slotlab/games vu du CT
-SRC_REMOTE=$(dirname "$REMOTE")/src     # = /mnt/storage/slotlab/src vu du CT (docker build)
+HOST=${SLOTLAB_DEPLOY_HOST:-root@192.168.1.200}
+REMOTE=/mnt/storage/slotlab/games     # disque USB du serveur Debian (ex-CT 102)
+SRC_REMOTE=$(dirname "$REMOTE")/src     # sources pour docker build
 CONTAINER=${SLOTLAB_CONTAINER:-slotlab-share}
 STACK_DIR=${SLOTLAB_STACK_DIR:-/opt/stacks/slotlab-share}
 # Le hub relit son disque à chaud : plus besoin de recréer le conteneur, donc
@@ -72,12 +72,12 @@ if [[ $REBUILD_IMAGE -eq 1 ]]; then
   step "Sources SlotLab → $HOST puis reconstruction de l'image (~4 min)"
   rsync -a $DRY --itemize-changes --exclude target --exclude node_modules \
     --exclude .git --exclude dist --exclude Dockerfile "$REPO/" "$HOST:$SRC_REMOTE/"
-  [[ -n "$DRY" ]] || ssh "$HOST" "pct exec 102 -- docker build -t slotlab-share:latest /mnt/storage/slotlab/src" 2>&1 | tail -3
+  [[ -n "$DRY" ]] || ssh "$HOST" "docker build -t slotlab-share:latest /mnt/storage/slotlab/src" 2>&1 | tail -3
   # Reconstruire l'image ne suffit pas : le conteneur continue de tourner sur
   # l'ancienne (docker compose up -d sans changement de tag est un no-op). Sans
   # ce recreate, un correctif de code est buildé puis jamais servi.
   [[ -n "$DRY" ]] || ssh "$HOST" \
-    "pct exec 102 -- sh -c 'cd $STACK_DIR && docker compose up -d --force-recreate'" 2>&1 | tail -3
+    "cd $STACK_DIR && docker compose up -d --force-recreate" 2>&1 | tail -3
 fi
 
 [[ -n "$DRY" ]] && { echo; echo "(dry-run : rien n'a été envoyé)"; exit 0; }

@@ -33,9 +33,39 @@ pub struct LoadedGame {
     pub modes: Vec<LoadedMode>,
     /// Fingerprint of the source files (auto invalidation, cf. P2).
     pub fingerprint: u64,
+    /// When these files were read. A `run.py prod` that lands later leaves
+    /// every panel showing the previous math (client, WILD CURRENT
+    /// 2026-10-05: an hour of feedback on a version already replaced) —
+    /// `source_changed` says so, and the watcher reloads.
+    pub loaded_at: std::time::SystemTime,
 }
 
 impl LoadedGame {
+    /// The paths this game is read from: index.json, every lookup table,
+    /// every books file.
+    pub fn source_paths(&self) -> Vec<std::path::PathBuf> {
+        let dir = &self.entry.publish_dir;
+        let mut out = vec![dir.join("index.json")];
+        for m in &self.modes {
+            out.push(dir.join(&m.config.weights));
+            out.push(dir.join(&m.config.events));
+        }
+        out
+    }
+
+    /// Newest modification time among the source files (`None`: unreadable).
+    pub fn source_mtime(&self) -> Option<std::time::SystemTime> {
+        self.source_paths()
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .max()
+    }
+
+    /// A source file changed on disk since this load.
+    pub fn source_changed(&self) -> bool {
+        self.source_mtime().is_some_and(|m| m > self.loaded_at)
+    }
+
     /// `<repo>/frontend` — the monorepo root holding `apps/` and `packages/`,
     /// which is what the source-level checks grep.
     pub fn frontend_root(&self) -> Option<std::path::PathBuf> {
@@ -301,6 +331,7 @@ impl Registry {
                         })
                         .collect(),
                     fingerprint: g.fingerprint,
+                    loaded_at: g.loaded_at,
                 }),
             );
         }
@@ -367,25 +398,92 @@ pub fn fingerprint_file(path: &Path) -> u64 {
 /// Guesses the frontend static build from publish_dir:
 /// `<repo>/math/games/<id>/library/publish_files` →
 /// `<repo>/frontend/apps/<game name>/build`, otherwise the single
-/// existing `frontend/apps/*/build`.
+/// existing `frontend/apps/*/build`, otherwise a client's prebuilt front
+/// delivered next to the math (`detect_client_dist`).
 pub fn detect_build_dir(publish_dir: &Path, game_name: &str) -> Option<std::path::PathBuf> {
     let s = publish_dir.to_string_lossy();
-    let root = s.split("/math/games/").next()?;
-    let apps = Path::new(root).join("frontend/apps");
+    let root = Path::new(s.split("/math/games/").next()?);
+    let apps = root.join("frontend/apps");
     let named = apps.join(game_name).join("build");
     if named.join("index.html").is_file() {
         return Some(named);
     }
     let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(&apps)
-        .ok()?
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path().join("build"))
         .filter(|p| p.join("index.html").is_file())
         .collect();
-    if candidates.len() == 1 {
-        return candidates.pop();
+    match candidates.len() {
+        1 => candidates.pop(),
+        0 => detect_client_dist(root),
+        _ => None,
     }
-    None
+}
+
+/// A client's prebuilt frontend delivered next to the math, outside any
+/// monorepo (Gaspi's UNDEAD KING: `<root>/Undead-King-front-dist/`): the
+/// single folder directly under the project root that is a BUILD — its
+/// `dist/` or `build/`, or the folder itself when it holds an `index.html`
+/// and no `package.json` (an `index.html` next to a `package.json` is the
+/// source of a Vite app, not something a browser can play).
+fn detect_client_dist(root: &Path) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for e in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !dir.is_dir() || name.starts_with('.') || matches!(name.as_ref(), "math" | "docs" | "node_modules") {
+            continue;
+        }
+        let built = [dir.join("dist"), dir.join("build")]
+            .into_iter()
+            .find(|d| d.join("index.html").is_file());
+        if let Some(d) = built {
+            candidates.push(d);
+        } else if dir.join("index.html").is_file() && !dir.join("package.json").exists() {
+            candidates.push(dir);
+        }
+    }
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
+/// How the game names its low / high symbols, read from its frontend build:
+/// the `math.symbols` table of a `game-config.json` (UNDEAD KING's front maps
+/// the books' `P1`…`P9` to `L5`…`H1`) at the root of the build or one or two
+/// folders down (`assets/<game>/game-config.json`). The math-sdk's own `H*` /
+/// `L*` otherwise.
+pub fn front_symbols(build_dir: Option<&Path>) -> slotlab_core::symbols::SymbolMap {
+    let Some(build) = build_dir else {
+        return Default::default();
+    };
+    let mut configs = vec![build.join("game-config.json")];
+    let mut dirs = vec![build.to_path_buf()];
+    for depth in 0..2 {
+        let mut next = Vec::new();
+        for d in &dirs {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    configs.push(p.join("game-config.json"));
+                    if depth == 0 {
+                        next.push(p);
+                    }
+                }
+            }
+        }
+        dirs = next;
+    }
+    configs
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .find_map(|bytes| slotlab_core::symbols::SymbolMap::from_front_config(&bytes))
+        .unwrap_or_default()
 }
 
 /// The game's frontend app folder: `<repo>/frontend/apps/<name>`, or the
@@ -412,6 +510,9 @@ pub fn detect_app_dir(publish_dir: &Path, game_name: &str) -> Option<std::path::
 }
 
 fn load_game(entry: GameEntry) -> Result<LoadedGame> {
+    // Taken BEFORE reading: a file rewritten while this load runs counts as
+    // changed, and the watcher reads it again.
+    let loaded_at = std::time::SystemTime::now();
     let dir = &entry.publish_dir;
     if !dir.is_dir() {
         bail!("publish_files directory not found: {}", dir.display());
@@ -440,5 +541,58 @@ fn load_game(entry: GameEntry) -> Result<LoadedGame> {
         index,
         modes,
         fingerprint: fp.digest(),
+        loaded_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("slotlab-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_client_front_next_to_the_math_is_the_build() {
+        // UNDEAD KING : pas de monorepo, le dist du client à la racine du projet,
+        // à côté d'une source Vite (index.html + package.json) qui ne compte pas.
+        let root = scratch("client-dist");
+        let publish = root.join("math/games/undeadking/library/publish_files");
+        std::fs::create_dir_all(&publish).unwrap();
+        touch(&root.join("docs/index.html"), "");
+        touch(&root.join("front-src/index.html"), "");
+        touch(&root.join("front-src/package.json"), "{}");
+        touch(&root.join("Undead-King-front-dist/index.html"), "<!doctype html>");
+        touch(
+            &root.join("Undead-King-front-dist/assets/undead-king/game-config.json"),
+            r#"{"math":{"symbols":{"P1":"L5","P9":"H1"}}}"#,
+        );
+        let build = detect_build_dir(&publish, "undeadking");
+        assert_eq!(build.as_deref(), Some(root.join("Undead-King-front-dist").as_path()));
+        // Sa table de symboles est lue dans `assets/<jeu>/game-config.json`.
+        let symbols = front_symbols(build.as_deref());
+        assert_eq!(symbols.classify("P9"), Some(slotlab_core::symbols::SymClass::High));
+        assert!(front_symbols(None).is_empty());
+
+        // Deux builds candidats : on ne devine pas.
+        touch(&root.join("other/dist/index.html"), "");
+        assert_eq!(detect_build_dir(&publish, "undeadking"), None);
+
+        // Un monorepo garde la priorité.
+        touch(&root.join("frontend/apps/undeadking/build/index.html"), "");
+        assert_eq!(
+            detect_build_dir(&publish, "undeadking").as_deref(),
+            Some(root.join("frontend/apps/undeadking/build").as_path())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

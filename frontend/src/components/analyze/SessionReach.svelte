@@ -3,13 +3,21 @@
   import { oneIn, pct } from '../../lib/populations';
   import { errorText } from '../../lib/stores.svelte';
   import { storageGetJson, storageSetJson } from '../../lib/storage';
+  import { rowOf, type ModeMarket } from '../../lib/market';
 
   /**
    * « Sur N spins, combien de sessions n'atteignent jamais X ? » — la session dont
    * le joueur repart sans rien de gros. Exact (lu dans la LUT, spins indépendants),
    * pour n'importe quel nombre de spins et n'importe quel multiplicateur.
    */
-  let { game, mode }: { game: string; mode: string } = $props();
+  let { game, mode, market = undefined }: { game: string; mode: string; market?: ModeMarket } = $props();
+
+  /** The peers' figure for the same question (6 000 spins without 500x / 1 000x). */
+  const peers = $derived.by(() => {
+    if (!market || Math.round(spins) !== 6000) return null;
+    const key = x === 500 ? 'never500' : x === 1000 ? 'never1000' : null;
+    return key ? rowOf(market, key) ?? null : null;
+  });
 
   const KEY = 'slotlab.analyze.reach';
   let spins = $state(6000);
@@ -71,6 +79,9 @@
           session on average · {pct(1 - result.never)} of sessions see at least one
         {:else}
           No spin of this mode ever pays {result.x}x.
+        {/if}
+        {#if peers}
+          · peers {pct(peers.p25)} · <b>{pct(peers.median)}</b> · {pct(peers.p75)} (studio aim 20–30 %)
         {/if}
       </p>
     {/if}

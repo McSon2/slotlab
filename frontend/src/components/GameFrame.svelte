@@ -9,9 +9,33 @@
     /** Display factor — the iframe's LOGICAL dimensions stay
      * width×height (essential for faithful responsive QA). */
     scale?: number;
+    /** Game clock rate (1 = real time, 0 = frozen), applied by the time
+     * warp SlotLab injects into the builds it serves. */
+    speed?: number;
   }
 
-  const { url, width, height, label, game, scale = 1 }: Props = $props();
+  const { url, width, height, label, game, scale = 1, speed = 1 }: Props = $props();
+
+  let frame = $state<HTMLIFrameElement>();
+
+  function sendSpeed() {
+    frame?.contentWindow?.postMessage({ slotlab: 'speed', value: speed }, '*');
+  }
+
+  $effect(() => {
+    void speed;
+    sendSpeed();
+  });
+
+  // The injected script asks for the rate as soon as it runs, before the
+  // game boots: a reloaded frame starts at the chosen speed.
+  $effect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.source === frame?.contentWindow && e.data?.slotlab === 'speed?') sendSpeed();
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  });
 
   const title = $derived(
     game ? `${game} — ${label} (${width}×${height})` : `${label} (${width}×${height})`,
@@ -21,13 +45,17 @@
 <div class="frame-card">
   <div class="frame-head">
     <span>{label}</span>
-    <span class="dim num">{width}×{height}</span>
+    <span class="dim num">
+      {#if speed !== 1}<span class="speed">{speed === 0 ? 'paused' : `×${speed}`}</span>{/if}
+      {width}×{height}
+    </span>
   </div>
   <div
     class="frame-clip"
     style="width: {width * scale}px; height: {height * scale}px;"
   >
     <iframe
+      bind:this={frame}
       src={url}
       {title}
       style="width: {width}px; height: {height}px; transform: scale({scale});"
@@ -53,6 +81,11 @@
 
   .frame-head .num {
     font-size: var(--fs-xs);
+  }
+
+  .speed {
+    color: var(--warn);
+    margin-right: var(--sp-1);
   }
 
   .frame-clip {

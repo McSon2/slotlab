@@ -19,6 +19,9 @@
 //!     sans quoi la valeur d'un poisson +N et le facteur d'un poisson ×N, qui
 //!     partagent `fishValue`, se mélangeraient ;
 //!   · le type de l'événement lui-même, sous la facette `#events`.
+//! Format « actions » (UNDEAD KING) : un événement sans `type` est une suite
+//! d'actions `{kind, data}` ; chacune se lit comme un événement de type `kind`
+//! dont les champs sont ceux de `data`.
 //! Sont sautés : les plateaux (tableaux de tableaux), les objets imbriqués, les
 //! coordonnées (`reel`, `row`…) et `index`/`type`. Une facette qui prend plus de
 //! `MAX_VALUES` valeurs distinctes est CONTINUE (montants, multiplicateurs
@@ -74,7 +77,8 @@ fn scalar(raw: &RawValue) -> Option<&str> {
 }
 
 fn skipped(key: &str) -> bool {
-    SKIP_KEYS.contains(&key)
+    // `…panel` / `…panels` : coordonnées `[rangée, colonne]` du format « actions ».
+    SKIP_KEYS.contains(&key) || key.ends_with("panel") || key.ends_with("panels")
 }
 
 /// Occurrences d'un book, par (facette, valeur). `events` : le tableau
@@ -102,58 +106,95 @@ pub fn scan_book_with(events: &[&RawValue], mut emit: impl FnMut(&str, &str)) {
         let Ok(obj) = serde_json::from_str::<HashMap<&str, &RawValue>>(ev.get()) else {
             continue;
         };
-        let Some(typ) = obj.get("type").and_then(|r| scalar(r)) else {
+        if let Some(typ) = obj.get("type").and_then(|r| scalar(r)) {
+            bump(format_args!("{EVENTS_FACET}"), typ);
+            scan_fields(typ, &obj, &mut bump, &mut pair);
+            continue;
+        }
+        // Format « actions » (UNDEAD KING) : chaque action `{kind, data}` se lit
+        // comme un événement de type `kind` dont les champs sont ceux de `data`
+        // (`ScepterAddWildMult.add`), ou `kind.data` quand `data` est un scalaire
+        // (`BonusGames.data` : les free spins attribués).
+        let Some(actions) = obj
+            .get("actions")
+            .and_then(|r| serde_json::from_str::<Vec<&RawValue>>(r.get()).ok())
+        else {
             continue;
         };
-        bump(format_args!("{EVENTS_FACET}"), typ);
-        for (key, raw) in &obj {
-            if skipped(key) {
-                continue;
-            }
-            if let Some(v) = scalar(raw) {
-                bump(format_args!("{typ}.{key}"), v);
-                continue;
-            }
-            let text = raw.get().trim_start();
-            if !text.starts_with('[') || text[1..].trim_start().starts_with('[') {
-                continue; // objet imbriqué, ou plateau
-            }
-            let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) else {
+        for action in actions {
+            let Ok(a) = serde_json::from_str::<HashMap<&str, &RawValue>>(action.get()) else {
                 continue;
             };
-            for item in items {
-                if let Some(v) = scalar(item) {
-                    bump(format_args!("{typ}.{key}[]"), v);
+            let Some(kind) = a.get("kind").and_then(|r| scalar(r)) else {
+                continue;
+            };
+            bump(format_args!("{EVENTS_FACET}"), kind);
+            let Some(data) = a.get("data") else {
+                continue;
+            };
+            if let Some(v) = scalar(data) {
+                bump(format_args!("{kind}.data"), v);
+            } else if let Ok(fields) = serde_json::from_str::<HashMap<&str, &RawValue>>(data.get()) {
+                scan_fields(kind, &fields, &mut bump, &mut pair);
+            }
+        }
+    }
+}
+
+/// Les facettes des champs d'un événement de type `typ` (règle du module).
+fn scan_fields(
+    typ: &str,
+    obj: &HashMap<&str, &RawValue>,
+    bump: &mut impl FnMut(std::fmt::Arguments, &str),
+    pair: &mut String,
+) {
+    for (key, raw) in obj {
+        if skipped(key) {
+            continue;
+        }
+        if let Some(v) = scalar(raw) {
+            bump(format_args!("{typ}.{key}"), v);
+            continue;
+        }
+        let text = raw.get().trim_start();
+        if !text.starts_with('[') || text[1..].trim_start().starts_with('[') {
+            continue; // objet imbriqué, ou plateau
+        }
+        let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) else {
+            continue;
+        };
+        for item in items {
+            if let Some(v) = scalar(item) {
+                bump(format_args!("{typ}.{key}[]"), v);
+                continue;
+            }
+            let Ok(fields) = serde_json::from_str::<HashMap<&str, &RawValue>>(item.get()) else {
+                continue;
+            };
+            let scalars: Vec<(&str, &str, bool)> = fields
+                .iter()
+                .filter(|(field, _)| !skipped(field))
+                .filter_map(|(field, fraw)| {
+                    let v = scalar(fraw)?;
+                    // Une « sorte » : un texte qui n'est ni un nombre ni un booléen.
+                    let kind = fraw.get().trim_start().starts_with('"') && v.parse::<f64>().is_err();
+                    Some((*field, v, kind))
+                })
+                .collect();
+            for &(field, v, _) in &scalars {
+                bump(format_args!("{typ}.{key}[].{field}"), v);
+            }
+            for &(kfield, kv, is_kind) in &scalars {
+                if !is_kind {
                     continue;
                 }
-                let Ok(fields) = serde_json::from_str::<HashMap<&str, &RawValue>>(item.get()) else {
-                    continue;
-                };
-                let scalars: Vec<(&str, &str, bool)> = fields
-                    .iter()
-                    .filter(|(field, _)| !skipped(field))
-                    .filter_map(|(field, fraw)| {
-                        let v = scalar(fraw)?;
-                        // Une « sorte » : un texte qui n'est ni un nombre ni un booléen.
-                        let kind = fraw.get().trim_start().starts_with('"') && v.parse::<f64>().is_err();
-                        Some((*field, v, kind))
-                    })
-                    .collect();
                 for &(field, v, _) in &scalars {
-                    bump(format_args!("{typ}.{key}[].{field}"), v);
-                }
-                for &(kfield, kv, is_kind) in &scalars {
-                    if !is_kind {
-                        continue;
-                    }
-                    for &(field, v, _) in &scalars {
-                        if field != kfield {
-                            pair.clear();
-                            pair.push_str(kv);
-                            pair.push('|');
-                            pair.push_str(v);
-                            bump(format_args!("{typ}.{key}[].{field}@{kfield}"), &pair);
-                        }
+                    if field != kfield {
+                        pair.clear();
+                        pair.push_str(kv);
+                        pair.push('|');
+                        pair.push_str(v);
+                        bump(format_args!("{typ}.{key}[].{field}@{kfield}"), pair);
                     }
                 }
             }
@@ -591,6 +632,27 @@ mod tests {
             && !f.contains("from")
             && !f.contains("positions")
             && f != "reveal.index"));
+    }
+
+    #[test]
+    fn reads_the_actions_format() {
+        let m = scan(
+            r#"{"events":[
+            {"index":0,"win":0,"actions":[{"kind":"Haywire"},{"kind":"GridSnapshot","data":{"board":0,"progressiveBarValue":0,"cols":[["P1","BONUS"],["P9","P2"]]}}]},
+            {"index":1,"win":0,"actions":[{"kind":"ScepterAddWildMult","data":{"scepter_panel":[0,5],"wild_panel":[2,5],"from":1,"to":3,"add":2}},
+                {"kind":"ScepterAddWildMult","data":{"scepter_panel":[1,5],"wild_panel":[2,5],"from":3,"to":8,"add":5}}]},
+            {"index":2,"win":0,"actions":[{"kind":"BonusGames","data":10}]},
+            {"index":3,"win":1.5,"actions":[{"kind":"LinesHit","data":{"line":1,"streak":3,"panels":[[0,0],[0,1],[0,2]],"symbol":"P9"}}]}]}"#,
+        );
+        assert_eq!(get(&m, EVENTS_FACET, "Haywire"), 1);
+        assert_eq!(get(&m, EVENTS_FACET, "ScepterAddWildMult"), 2);
+        assert_eq!(get(&m, "ScepterAddWildMult.add", "2"), 1);
+        assert_eq!(get(&m, "ScepterAddWildMult.add", "5"), 1);
+        assert_eq!(get(&m, "BonusGames.data", "10"), 1);
+        assert_eq!(get(&m, "LinesHit.symbol", "P9"), 1);
+        assert_eq!(get(&m, "LinesHit.streak", "3"), 1);
+        // Plateau et coordonnées `[rangée, colonne]` : jamais des facettes.
+        assert!(m.keys().all(|(f, _)| !f.contains("cols") && !f.contains("panel") && !f.contains("board")));
     }
 
     #[test]

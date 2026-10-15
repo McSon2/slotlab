@@ -44,6 +44,15 @@ pub struct BookFacts {
     pub spins_final: u16,
     /// Gain du bonus seul (×100) ; `None` : le book ne le dit pas.
     pub fg_win_x100: Option<u64>,
+    /// Symboles payants low / high révélés hors bonus, puis en free spins
+    /// (`crate::symbols`).
+    pub sym_low: u16,
+    pub sym_high: u16,
+    pub sym_low_fs: u16,
+    pub sym_high_fs: u16,
+    /// Le spin payé annonce le scatter manquant (`anticipation` du premier
+    /// `reveal`, `crate::freespins`).
+    pub antic: bool,
 }
 
 /// Une tranche de gain et ce qui la porte.

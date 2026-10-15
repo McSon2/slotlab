@@ -19,6 +19,7 @@
 //! reference of 2026-09-14).
 
 use crate::model::Lut;
+use crate::session;
 use serde::{Deserialize, Serialize};
 use std::sync::{OnceLock, RwLock};
 
@@ -57,6 +58,32 @@ pub struct Fig {
     pub p1000: f64,
     pub p5000: f64,
     pub p10000: f64,
+    /// Share of the value carried by the top 1 % of the rounds (what SlotLab
+    /// prints as « the top 1 % carries … »). NaN in a dataset built before it.
+    #[serde(default = "nan", deserialize_with = "nan_or_f64", skip_serializing_if = "is_nan")]
+    pub top1: f64,
+    /// A 100-round session (`session`): median return, share of winning
+    /// sessions, share giving back under 20 % — in stakes. NaN for buys and
+    /// in a dataset built before them.
+    #[serde(default = "nan", deserialize_with = "nan_or_f64", skip_serializing_if = "is_nan")]
+    pub s100_median: f64,
+    #[serde(default = "nan", deserialize_with = "nan_or_f64", skip_serializing_if = "is_nan")]
+    pub s100_win: f64,
+    #[serde(default = "nan", deserialize_with = "nan_or_f64", skip_serializing_if = "is_nan")]
+    pub s100_bust: f64,
+}
+
+fn nan() -> f64 {
+    f64::NAN
+}
+
+/// serde_json writes a NaN as `null`: read it back as the NaN it was.
+fn nan_or_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+}
+
+fn is_nan(v: &f64) -> bool {
+    v.is_nan()
 }
 
 /// One mode of the reference.
@@ -187,9 +214,9 @@ pub const KEYS: [&str; 10] = ["hit", "winsUnderStake", "p100", "p500", "p1000", 
 /// The figures worth comparing for each kind of mode, in display order.
 pub fn keys_for(kind: &str) -> &'static [&'static str] {
     match kind {
-        "buy" => &["rtp", "median", "q25", "q75", "q90", "crumbs", "nearZero", "p1", "neverRefunded", "p2", "p5", "p10", "p50", "pmax", "vs10", "vol"],
+        "buy" => &["rtp", "median", "q25", "q75", "q90", "crumbs", "nearZero", "p1", "neverRefunded", "p2", "p5", "p10", "p50", "pmax", "vs10", "top1", "vol"],
         "bust" => &["rtp", "zero", "p1", "p2", "p5", "p10", "p50", "pmax", "vol"],
-        _ => &["rtp", "hit", "winsUnderStake", "p1", "p10", "p100", "p500", "p1000", "p5000", "p10000", "pmax", "never500", "never1000", "vs100", "vs1000", "vol"],
+        _ => &["rtp", "hit", "winsUnderStake", "s100Median", "s100Win", "s100Bust", "p1", "p10", "p100", "p500", "p1000", "p5000", "p10000", "pmax", "never500", "never1000", "vs100", "vs1000", "top1", "vol"],
     }
 }
 
@@ -252,8 +279,14 @@ impl Figures for Fig {
             "never500" => never(self.p500),
             "never1000" => never(self.p1000),
             "neverRefunded" => (1.0 - self.p1).max(0.0).powi(BUY_STREAK),
+            "top1" => self.top1,
+            "s100Median" => self.s100_median,
+            "s100Win" => self.s100_win,
+            "s100Bust" => self.s100_bust,
             _ => return None,
         })
+        // A figure the dataset does not hold (built before it) is no figure.
+        .filter(|v| v.is_finite())
     }
 }
 
@@ -298,6 +331,26 @@ pub fn figures_of(mut dist: Vec<(f64, f64)>, cost: f64) -> Fig {
     };
     let hit = add(&mut dist.iter().filter(|d| d.0 > 0.0).map(|d| d.1)) / w;
     let under_stake = add(&mut dist.iter().filter(|d| d.0 > 0.0 && d.0 < c - 1e-9).map(|d| d.1)) / w;
+    // Value in the top 1 % of the weight, from the biggest win down, the
+    // straddling row taken in part (`population::top_slice`).
+    let top1 = {
+        let target = 0.01 * w;
+        let (mut mass, mut top) = (0.0, 0.0);
+        for &(x, ww) in dist.iter().rev() {
+            if mass >= target {
+                break;
+            }
+            let take = ww.min(target - mass);
+            top += take * x;
+            mass += take;
+        }
+        if v > 0.0 { top / v } else { 0.0 }
+    };
+    let s100 = if c < 10.0 {
+        session::short_session(&dist.iter().map(|&(x, ww)| (x / c, ww)).collect::<Vec<_>>(), session::SPINS)
+    } else {
+        None
+    };
     Fig {
         rtp: mean / c,
         hit,
@@ -326,6 +379,10 @@ pub fn figures_of(mut dist: Vec<(f64, f64)>, cost: f64) -> Fig {
         p1000: at(1000.0),
         p5000: at(5000.0),
         p10000: at(10000.0),
+        top1,
+        s100_median: s100.map_or(f64::NAN, |s| s.median),
+        s100_win: s100.map_or(f64::NAN, |s| s.win),
+        s100_bust: s100.map_or(f64::NAN, |s| s.bust),
     }
 }
 
@@ -411,7 +468,7 @@ impl Peers {
     /// bigger max win look « rarer than most ».
     fn values(&self, key: &str) -> Vec<f64> {
         let scale = |g: &MarketMode, v: f64| if key == "pmax" && self.anchor > 0.0 { v * g.fig.max / self.anchor } else { v };
-        let mut v: Vec<f64> = self.games.iter().filter_map(|g| g.figure(key).map(|x| scale(g, x))).collect();
+        let mut v: Vec<f64> = self.games.iter().filter_map(|g| g.figure(key).map(|x| scale(g, x))).filter(|x| x.is_finite()).collect();
         v.sort_by(f64::total_cmp);
         v
     }
@@ -616,6 +673,10 @@ pub fn compare_mode(mode: &str, lut: &Lut, cost: f64) -> Option<ModeMarket> {
         .filter_map(|&key| {
             let value = fig.figure(key)?;
             let v = peers.values(key);
+            // A figure the reference does not hold yet (its next refresh will).
+            if v.len() < MIN_PEERS / 2 {
+                return None;
+            }
             // Nothing to read where no one reaches it (10 000 stakes of a 3x ante).
             (value > 0.0 || v.last().is_some_and(|&x| x > 0.0)).then(|| Row {
                 key,

@@ -119,7 +119,21 @@ export const FIGURES: Record<string, FigureSpec> = {
   vs100: { label: (m) => `RTP carried by wins ≥ 100× ${stakeWord(m)}`, format: pct, scale: 'linear' },
   vs1000: { label: (m) => `RTP carried by wins ≥ 1,000× ${stakeWord(m)}`, format: pct, scale: 'linear' },
   vol: { label: (m) => `Volatility (std ÷ ${m.kind === 'buy' || m.kind === 'bust' ? 'price' : 'stake'})`, format: (v) => v.toFixed(1), scale: 'linear' },
+  top1: { label: () => 'Value carried by the top 1 % of rounds', format: pct, scale: 'linear' },
+  s100Median: { label: (m) => `100 ${m.kind === 'ante' ? 'rounds' : 'spins'}: median return (of 100 ${stakeWord(m)}s)`, format: (v) => `${v.toFixed(0)}`, scale: 'linear' },
+  s100Win: { label: (m) => `100 ${m.kind === 'ante' ? 'rounds' : 'spins'}: sessions ending ahead`, format: pct, scale: 'linear' },
+  s100Bust: { label: (m) => `100 ${m.kind === 'ante' ? 'rounds' : 'spins'}: sessions giving back under 20`, format: pct, scale: 'linear' },
 };
+
+/** The rows of a mode, by key. */
+export function rowOf(m: ModeMarket | undefined, key: string): MarketRow | undefined {
+  return m?.rows.find((r) => r.key === key);
+}
+
+/** « 20 · 36 · 74 » — p25, median, p75 of the peers, in the figure's format. */
+export function quartilesText(r: MarketRow, format: (v: number) => string): string {
+  return `${format(r.p25)} · ${format(r.median)} · ${format(r.p75)}`;
+}
 
 /** Who the peers are, in a sentence. */
 export function peersSentence(m: ModeMarket): string {

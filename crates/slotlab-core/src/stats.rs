@@ -1,4 +1,5 @@
 use crate::model::Lut;
+use crate::session::{self, ShortSession};
 use serde::Serialize;
 
 /// Statistics of a mode, computed solely from its LUT.
@@ -43,6 +44,9 @@ pub struct ModeStats {
     pub top_payouts: Vec<TopPayout>,
     /// payout_x100 % 10 != 0 somewhere → 0.1x granularity violated.
     pub granularity_violations: usize,
+    /// What 100 rounds of this mode give back (`session`): spinning modes only
+    /// (under 10x) — a run of purchases is not a session.
+    pub short_session: Option<ShortSession>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +216,13 @@ pub fn analyze(lut: &Lut, cost: f64) -> ModeStats {
 
     let max_payout = max_payout_x100 as f64 / 100.0;
     let buckets = build_buckets(&sorted, t, cost, max_payout);
+    let short_session = (cost < 10.0)
+        .then(|| {
+            let dist: Vec<(f64, f64)> =
+                sorted.iter().map(|&(p, w, _)| (p as f64 / 100.0 / cost, w as f64)).collect();
+            session::short_session(&dist, session::SPINS)
+        })
+        .flatten();
 
     ModeStats {
         cost,
@@ -244,6 +255,7 @@ pub fn analyze(lut: &Lut, cost: f64) -> ModeStats {
         buckets,
         top_payouts: tops,
         granularity_violations,
+        short_session,
     }
 }
 

@@ -18,5 +18,7 @@ pub mod preflight;
 pub mod provenance;
 pub mod reach;
 pub mod review;
+pub mod session;
 pub mod stats;
+pub mod symbols;
 pub mod tiers;

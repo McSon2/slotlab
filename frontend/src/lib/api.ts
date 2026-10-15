@@ -1,4 +1,5 @@
 import type { ModePopulations } from './populations';
+import type { GameMarket } from './market';
 
 export interface ModeSummary {
   name: string;
@@ -107,6 +108,20 @@ export interface ModeStats {
   buckets: Bucket[];
   topPayouts: TopPayout[];
   granularityViolations: number;
+  /** 100 rounds of the mode, exact (`slotlab-core/src/session.rs`); null for buys. */
+  shortSession: ShortSession | null;
+}
+
+/** What a short session gives back, in stakes of the mode. */
+export interface ShortSession {
+  spins: number;
+  p25: number;
+  median: number;
+  p75: number;
+  /** Share of sessions ending at or above the stakes put in. */
+  win: number;
+  /** Share of sessions giving back under 20 % of the stakes put in. */
+  bust: number;
 }
 
 export interface BonusGroup {
@@ -637,8 +652,25 @@ export interface SessionReach {
   never: number;
 }
 
+/** Which build of the math the panels show — `GET /api/ui/games/{name}/version`. */
+export interface GameVersion {
+  game: string;
+  /** As a string: a u64 does not survive a JSON number. */
+  fingerprint: string;
+  /** Unix ms when the files were read. */
+  loadedAt: number;
+  sourceMtime: number | null;
+  /** A publish file changed on disk since `loadedAt` (SlotLab reloads by itself within seconds). */
+  sourceChanged: boolean;
+  imported: boolean;
+  importing: boolean;
+}
+
 export const api = {
   listGames: () => request<GameSummary[]>('/api/ui/games'),
+  gameVersion: (name: string) => request<GameVersion>(`/api/ui/games/${encodeURIComponent(name)}/version`),
+  /** Every mode against its market peers — cf. `lib/market.ts`. */
+  market: (name: string) => request<GameMarket>(`/api/ui/games/${encodeURIComponent(name)}/market`),
   registerGame: (name: string, publishDir: string, frontUrl: string) =>
     request<{ ok: boolean; modes: string[] }>('/api/ui/games', {
       method: 'POST',

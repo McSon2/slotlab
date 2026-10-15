@@ -315,8 +315,61 @@ pub async fn resolve_mw(
     next.run(req).await
 }
 
+/// ⚠️ CACHE — every static file goes out `no-cache` + a content ETag.
+///
+/// The hub used to send NO cache header at all. Cloudflare fills that gap on
+/// images with `cache-control: max-age=14400`, while `.json` / `.atlas` /
+/// `.js` pass uncached. After every redeploy the browser therefore assembled
+/// the NEW Spine skeleton with the OLD atlas page of the same name (and the
+/// old symbol vignettes), for four hours: symbols cut anywhere, previous
+/// symbol still shown. `Cmd+Shift+R` can't help — Pixi loads its images from
+/// a worker. Lived on BLOOD WATER (2026-09-15), TOXIC SPINS (2026-10-03),
+/// BUBBLE HEX (2026-10-05).
+///
+/// `no-cache` = "store it, but ask before reusing it": Cloudflare neither
+/// edge-caches it nor applies its Browser Cache TTL, and the browser
+/// revalidates with `If-None-Match`. An unchanged file costs a body-less 304;
+/// a changed one is downloaded. Fixed for every game at once, whatever its
+/// file names.
+const STATIC_CACHE_CONTROL: &str = "no-cache";
+
+/// Content ETag (xxh3 of the bytes actually sent: the HTML WITH its injected
+/// console). Strong, but compared weakly: Cloudflare turns it into `W/"…"`
+/// when it recompresses the body.
+fn static_response(req_headers: &axum::http::HeaderMap, mime: String, body: Vec<u8>) -> Response {
+    let tag = format!("\"{:016x}\"", xxhash_rust::xxh3::xxh3_64(&body));
+    let fresh = req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_start_matches("W/"))
+                .any(|t| t == "*" || t == tag)
+        });
+    if fresh {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, tag), (header::CACHE_CONTROL, STATIC_CACHE_CONTROL.to_string())],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::ETAG, tag),
+            (header::CACHE_CONTROL, STATIC_CACHE_CONTROL.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Static files of the game the Host resolved to.
-pub async fn serve_static(Extension(game): Extension<Arc<HubGame>>, uri: Uri) -> Response {
+pub async fn serve_static(
+    Extension(game): Extension<Arc<HubGame>>,
+    uri: Uri,
+    req_headers: axum::http::HeaderMap,
+) -> Response {
     let rel = uri.path().trim_start_matches('/');
     if rel.split('/').any(|c| c == "..") {
         return StatusCode::FORBIDDEN.into_response();
@@ -349,13 +402,9 @@ pub async fn serve_static(Extension(game): Extension<Arc<HubGame>>, uri: Uri) ->
                     Some(i) => format!("{}{}{}", &html[..i], snippet, &html[i..]),
                     None => format!("{html}{snippet}"),
                 };
-                return (
-                    [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-                    injected,
-                )
-                    .into_response();
+                return static_response(&req_headers, mime.as_ref().to_string(), injected.into_bytes());
             }
-            ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
+            static_response(&req_headers, mime.as_ref().to_string(), bytes)
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }

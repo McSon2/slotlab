@@ -1,7 +1,9 @@
 <script lang="ts">
   import { fmtOneIn, fmtPct, type ModeStats, type GameCheckReport } from '../../lib/api';
   import { fx, pct, oneIn, type ModePopulations } from '../../lib/populations';
-  import { issuesOf, type Issue, type Severity, type Target } from '../../lib/findings';
+  import { issuesOf, expectedHit, type Issue, type Severity, type Target } from '../../lib/findings';
+  import { rowOf, type GameMarket } from '../../lib/market';
+  import Budget from './Budget.svelte';
 
   /**
    * The whole game on one screen: what deserves a look (findings computed
@@ -17,13 +19,26 @@
     issues: Issue[];
     /** Bonus analysis and celebration ladders loaded: the list is complete. */
     ready: boolean;
+    /** Every mode against its market peers (null while loading). */
+    market: GameMarket | null;
     onSelectMode: (mode: string) => void;
     onTarget: (t: Target) => void;
   }
 
-  const { stats, checks, pops, selectedMode, issues, ready, onSelectMode, onTarget }: Props = $props();
+  const { stats, checks, pops, selectedMode, issues, ready, market, onSelectMode, onTarget }: Props = $props();
 
   const current = $derived(stats.find((m) => m.mode === selectedMode)?.stats);
+  const currentPops = $derived(pops.find((m) => m.mode === selectedMode));
+  const currentMarket = $derived(market?.modes.find((m) => m.mode === selectedMode));
+  /** What 100 rounds give back, next to the peers' quartiles. */
+  const session = $derived.by(() => {
+    const s = current?.shortSession;
+    if (!s) return null;
+    const q = (key: string) => rowOf(currentMarket, key);
+    return { s, median: q('s100Median'), win: q('s100Win'), bust: q('s100Bust') };
+  });
+  /** Hit rate the studio expects for this max win — base games only. */
+  const hitAim = $derived(current && current.cost <= 2 && currentPops?.populations.some((p) => p.kind === 'tier') ? expectedHit(current.maxPayout) : null);
 
   // ── Worth a look: one card per mode, one line per problem ──
   let showContext = $state(false);
@@ -79,20 +94,9 @@
     return { dead, sub: Math.max(0, current.hitRate - win), win };
   });
 
-  function streak1in1000(p: number): number {
-    if (p <= 0 || p >= 1) return 0;
-    return Math.log(0.001) / Math.log(p);
-  }
-
-  const streaks = $derived.by(() => {
-    if (!current) return null;
-    return {
-      betweenWin: 1 / Math.max(1e-9, current.hitRate),
-      worstZero: streak1in1000(current.zeroRate),
-      betweenProfit: 1 / Math.max(1e-9, current.breakevenRate),
-      worstLoss: streak1in1000(1 - current.breakevenRate),
-    };
-  });
+  const q3 = (r: { p25: number; median: number; p75: number } | undefined, f: (v: number) => string) =>
+    r ? `${f(r.p25)} · ${f(r.median)} · ${f(r.p75)}` : '';
+  const n0 = (v: number) => v.toFixed(0);
 </script>
 
 <section class="page">
@@ -220,7 +224,7 @@
     </table>
   </div>
 
-  {#if current && breakdown && streaks}
+  {#if current && breakdown}
     <p class="overline gap-xl">{selectedMode} — every spin</p>
     <div class="statline hero">
       <div><span class="dim">RTP</span><strong class="gold">{fmtPct(current.rtp, 2)}</strong></div>
@@ -233,7 +237,7 @@
 
     <div class="split">
       <div>
-        <p class="overline">Outcome breakdown</p>
+        <p class="overline">Outcome breakdown{#if hitAim}<span class="faint"> — studio aim ≈ {fmtPct(hitAim, 0)} paying for a {fx(current.maxPayout)} game</span>{/if}</p>
         <div class="breakdown-bar" aria-hidden="true">
           <span class="seg dead" style="width: {breakdown.dead * 100}%"></span>
           <span class="seg subbet" style="width: {breakdown.sub * 100}%"></span>
@@ -246,30 +250,45 @@
         </div>
       </div>
       <div>
-        <p class="overline">Streaks (1 in 1000)</p>
-        <div class="statline">
-          <div><span class="dim">Between 2 wins</span><strong>{streaks.betweenWin.toFixed(0)}</strong></div>
-          <div><span class="dim">Worst 0 streak</span><strong>{streaks.worstZero.toFixed(0)}</strong></div>
-          <div><span class="dim">Between 2 profits</span><strong>{streaks.betweenProfit.toFixed(0)}</strong></div>
-          <div><span class="dim">Worst loss streak</span><strong>{streaks.worstLoss.toFixed(0)}</strong></div>
-        </div>
+        <p class="overline">A short session <span class="faint">— 100 rounds, exact</span></p>
+        {#if session}
+          <div class="statline">
+            <div><span class="dim">Median return</span><strong>{n0(session.s.median)} <small>of 100</small></strong>{#if session.median}<em class="peers">peers {q3(session.median, n0)}</em>{/if}</div>
+            <div><span class="dim">Sessions ending ahead</span><strong>{pct(session.s.win)}</strong>{#if session.win}<em class="peers">peers {q3(session.win, pct)}</em>{/if}</div>
+            <div><span class="dim">Giving back under 20</span><strong>{pct(session.s.bust)}</strong>{#if session.bust}<em class="peers">peers {q3(session.bust, pct)}</em>{/if}</div>
+            <div><span class="dim">Middle half</span><strong>{n0(session.s.p25)}–{n0(session.s.p75)}</strong></div>
+          </div>
+          <p class="note">What 100 rounds at one stake give back — the « sec » feel of a short session (studio: the median, not the RTP; market base games ≈ 20 · 36 · 74). Peers appear once the market holds these figures (its next daily refresh).</p>
+        {:else}
+          <p class="note">Only for spin modes under 10x: a run of purchases is not a session.</p>
+        {/if}
       </div>
     </div>
 
-    <p class="overline gap-lg">Tail risk <span class="faint">(SlotLab estimate)</span></p>
-    <div class="statline">
-      <div><span class="dim">CVaR 0.1 %</span><strong>{fx(current.cvar001)}</strong></div>
-      <div><span class="dim">ETL 40x</span><strong>{current.etl40x.toFixed(4)}</strong></div>
-      <div><span class="dim">ETL 10kx</span><strong>{current.etl10kx.toFixed(4)}</strong></div>
-      <div><span class="dim">P(≥ 5k)</span><strong>{current.probWin5k.toExponential(3)}</strong></div>
-      <div><span class="dim">P(≥ 10k)</span><strong>{current.probWin10k.toExponential(3)}</strong></div>
-      <div><span class="dim">Unique payouts</span><strong>{current.uniquePayoutCount}</strong></div>
-      <div><span class="dim">Most likely</span><strong>{fmtOneIn(current.mostLikelyOneIn)}</strong></div>
-    </div>
-    <p class="note">
-      Tail metrics compare two math settings; they don't exactly match the
-      aggregated game-level Tail/CVaR/ETL on the Stake dashboard.
-    </p>
+    {#if currentPops?.anticipation}
+      {@const a = currentPops.anticipation}
+      <p class="overline">Anticipation <span class="faint">— reels slowing down for the missing scatter on the paid spin</span></p>
+      <div class="statline">
+        <div><span class="dim">Every spin</span><strong>{fmtOneIn(1 / a.all)}</strong></div>
+        <div><span class="dim">Without a bonus (near misses)</span><strong>{a.withoutBonus > 0 ? fmtOneIn(1 / a.withoutBonus) : 'never'}</strong></div>
+        {#if a.bonusAnnounced !== null}<div><span class="dim">Bonuses it announces</span><strong>{pct(a.bonusAnnounced)}</strong></div>{/if}
+      </div>
+      <p class="note">Read on each book's first reveal, weighted by the lookup table — ordinary spins that land the scatters count as much as the criteria that force them (the « nearmiss » feature line only sees the latter).</p>
+    {/if}
+
+    <Budget mp={currentPops} rtp={current.rtp} />
+
+    <details class="tail">
+      <summary>Tail risk <span class="faint">(SlotLab estimate — the dashboard aggregates it at game level)</span></summary>
+      <div class="statline">
+        <div><span class="dim">CVaR 0.1 %</span><strong>{fx(current.cvar001)}</strong></div>
+        <div><span class="dim">ETL 40x</span><strong>{current.etl40x.toFixed(4)}</strong></div>
+        <div><span class="dim">ETL 10kx</span><strong>{current.etl10kx.toFixed(4)}</strong></div>
+        <div><span class="dim">P(≥ 5k)</span><strong>{current.probWin5k.toExponential(3)}</strong></div>
+        <div><span class="dim">P(≥ 10k)</span><strong>{current.probWin10k.toExponential(3)}</strong></div>
+        <div><span class="dim">Most likely</span><strong>{fmtOneIn(current.mostLikelyOneIn)}</strong></div>
+      </div>
+    </details>
   {/if}
 </section>
 
@@ -579,5 +598,36 @@
     max-width: 780px;
     margin: 12px 0 0;
     line-height: 1.55;
+  }
+
+  .statline strong small {
+    font-size: var(--fs-xs);
+    font-weight: 400;
+    color: var(--text-faint);
+  }
+
+  .peers {
+    display: block;
+    font-style: normal;
+    font-family: var(--font-mono);
+    font-size: var(--fs-2xs);
+    color: var(--text-faint);
+    margin-top: 2px;
+  }
+
+  details.tail {
+    margin-top: 22px;
+  }
+
+  details.tail summary {
+    cursor: pointer;
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+  }
+
+  details.tail .statline {
+    margin-top: 10px;
   }
 </style>

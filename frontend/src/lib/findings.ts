@@ -17,7 +17,8 @@
  */
 
 import { fmtPct, type GameCheckReport, type ModeStats, type ModeTiers, type TierSpec } from './api';
-import { fx, pct, oneIn, threshold, type Band, type ModePopulations, type Population } from './populations';
+import { fx, pct, oneIn, threshold, quantile, cdfBelow, type Band, type ModePopulations, type Population } from './populations';
+import { FIGURES, inMiddleRow, position, type GameMarket, type ModeMarket, type MarketRow } from './market';
 
 export type Severity = 'blocking' | 'serious' | 'minor' | 'context';
 export const SEVERITIES: Severity[] = ['blocking', 'serious', 'minor', 'context'];
@@ -35,10 +36,12 @@ export type Category =
   | 'Across modes'
   | 'Sample'
   | 'Celebrations'
+  | 'Base game'
+  | 'Market'
   | 'Data';
 
 export interface Target {
-  view: 'explore' | 'compliance' | 'tiers';
+  view: 'explore' | 'compliance' | 'tiers' | 'market';
   mode?: string;
   key?: string;
 }
@@ -78,7 +81,7 @@ export const REF = {
   meanOverMedian: 3,
   top1: 0.4,
   essMin: 50,
-  buyMedianOverCost: 0.1,
+  buyMedianOverCost: 0.25,
   buyProfitableMin: 0.1,
   sameTierMedianGap: 1.3,
   subBetWins: 0.6,
@@ -104,6 +107,42 @@ export const REF = {
   lifetimeSpins: 1_000_000_000,
   memorableFrom: 1_000,
   memorableFromCost: 10,
+  /** Studio targets for a BASE game (LAST LAUGH 2026-10-01, TOXIC SPINS 2026-10-03, WILD CURRENT 2026-10-05): a bonus, any tier, at most 1 spin in `anyBonusMax` (aim 1/150–180); the first tier at most 1 in `firstTierMax` (aim 1/180–200, « même 1/240 »); the hidden (top tier of three or more) at most 1 in `hiddenMax` (« 1/20 000 max, c'est déjà très rare »). */
+  anyBonusMax: 200,
+  firstTierMax: 250,
+  hiddenMax: 20_000,
+  /** Aims, not limits — context up to the tolerance, a fault past it: any bonus 1/240 accepted (LAST LAUGH), 1/245 refused (WILD CURRENT v1); a first tier at 1/300 accepted on a low-volatility slot whose bonuses pay well (BUBBLE HEX), 1/350 refused (LAST LAUGH v2); the hidden at 1/22 400 on a 100 000x game is fine. */
+  bonusRareTolerance: 1.2,
+  firstTierTolerance: 1.5,
+  hiddenTolerance: 1.25,
+  /** A max win landing at least this often on a costly mode is a design (TOXIC SPINS 2026-10-03: DEGEN / HIDDEN / MYSTERY « en dessous de 1/3 000, je sais que ça ne correspond pas à la compliance, c'est pas grave »): the top of the curve and the CVaR are what the mode is. */
+  accessibleMaxWin: 5_000,
+  /** A step past ×4 by less than this is the grid, not a hole (TOXIC SPINS MYSTERY ×4.8 at 5k–10k, published). */
+  stepTolerance: 1.25,
+  /** Effective books of a memorable band: the 10 000 aim is a round figure — a band at two thirds of it is close (TOXIC SPINS published at 7.2k and 9.9k). */
+  bandEffectiveTolerance: 1.5,
+  /** Consecutive tiers: the higher at most this share as frequent as the lower (GREEDY GOBLIN 2026-10-02: a super at 1/24 next to a bonus at 1/20 — « presque autant » — refused; the base game keeps ×6). */
+  tierCloseness: 1 / 3,
+  /** Bonuses that look alike: P75 ÷ P25 of a bonus or a buy under this (BUBBLE HEX 2026-09-29: half the bonuses between 61x and 76x, ×1.25 — « toujours la même chose »; its published ×1.57 accepted). */
+  flatSpread: 1.4,
+  /** A triggered bonus ending under a tenth of its average is a dead one (TOXIC SPINS 2026-09-27: RAIDs at 2–6x made rare); market buys: 4–24 % under a tenth of the price. */
+  deadBonusShare: 0.25,
+  /** Bonuses carrying over this share of a base game's RTP leave a thin base game (WILD CURRENT 2026-10-05: 50/50 wanted at 30 000x; BUBBLE HEX: 22/78 questioned). */
+  bonusRtpShareMax: 0.75,
+  /** Hit rate of a base game by max win (studio, 2026-10-05): 5 000x → 32 %, 30 000x → 27 %, 100 000x → 19.5 % — the lower the ceiling, the more the RTP feeds small wins. */
+  hitByMax: [
+    [5_000, 0.32],
+    [30_000, 0.27],
+    [100_000, 0.195],
+  ] as [number, number][],
+  hitTolerance: 0.8,
+  /** An ante's max win: same share of the RTP as the base game ⇒ P(max) × its cost; ×/÷ 2 tolerated (TOXIC SPINS 2026-09-27: 1/13M vs 1/2M, « pourquoi un tel écart »). */
+  anteMaxWinTolerance: 2,
+  /** Market: a figure beyond this rank on either side (under p10, over p90) is a fault; inside the middle half nothing; between, context. */
+  marketOutRank: 0.1,
+  /** Paying symbols on screen (UNDEAD KING 2026-10-06): high ÷ (low + high) aims at 50 %, base game and free spins apart; nothing within ± `highShareTolerance`, minor past it, serious from twice as far. */
+  highShare: 0.5,
+  highShareTolerance: 0.05,
 };
 
 const WHY = {
@@ -122,6 +161,18 @@ const WHY = {
   pool: `Studio rule (2026-10-04, Toxic Spins: 34,000 books behind the 5-scatter bonus of the base game): at least ${(100_000).toLocaleString('en-US')} drawable books per bonus tier and per plain-spin feature (multi spin…), at least ${(10_000).toLocaleString('en-US')} on the max win, the rest for the base game. The lookup table sets the frequencies; the pool sets how many DIFFERENT rounds a player can see. Fix: re-allocate the criteria quotas (same total), rebuild the lookup table frozen — the distribution must not move.`,
   poolBands: 'Studio rule (2026-10-04): every band of a bonus from 1,000x up (from 10× the price of a buy) stands on at least 10,000 EFFECTIVE books ((Σw)² / Σw²) — those are the wins people film and remember; across all players the same round comes back after about √(π/2 · effective books) hits, so a band only counts if that happens within a hit game’s life (1 billion spins ÷ the mode’s cost) (Toxic Spins HIDDEN 50k-100k: 271 effective for 1 hit in 4,181 spins). Below, no minimum: a 30x bonus is not remembered. An empty band between two populated ones (often just under the max win) is a hole in that bonus. Fix: a targeted criteria (same bonus, win kept inside the band) for the missing books, the lookup table frozen; few effective books among many books = the table piles the weight on a few of them.',
   ess: `Fewer than ${REF.essMin} effective outcomes ((Σw)² / Σw²): players will see the same results again and again.`,
+  bonusRare: `Studio targets for a base game (LAST LAUGH, TOXIC SPINS, WILD CURRENT — 2026-10): a bonus, any tier, about 1 spin in 150–180 (« 1/350 c'est beaucoup trop rare », 1/240 accepted); the first tier about 1 in 180–200; the hidden between 1 in 15 000 and 1 in 20 000, never rarer (« 1/30 000 trop rare, 1/20 000 max »). The player must see bonuses often and the hidden must stay reachable.`,
+  tierClose: `Studio rule (GREEDY GOBLIN 2026-10-02): tiers must be well separated — a super almost as frequent as the bonus (1/24 vs 1/20) was refused; the base game keeps about ×6 between tiers, and a boosted mode keeps the same factor on every tier.`,
+  tierExtra: `GREEDY GOBLIN 2026-10-02: a 6th scatter when the hidden needs 5 « porterait à confusion » — a tier above the top bonus must not exist; cap the board at the top tier (and replay the round that would show one more).`,
+  hiddenFloor: `Studio rule (Degen Lab, WILD CURRENT 2026-10-05): the hidden is an event, never a small win — a floor (800x on a 30 000–100 000x game, 500x on 5 000–25 000x) and a median around 1 200x; it must never pay less than a typical bonus of the tier below.`,
+  sameTier: `Studio rule (LAST LAUGH 2026-10-01): a bonus tier pays the same — median, average, shape — in every mode it appears in (bought, triggered, mystery). « Si le hidden paie différemment dans chaque mode c'est visible et c'est pas bon. » Only round prices come first (then the gap is a decision, not a fault).`,
+  flat: `BUBBLE HEX 2026-09-29 (half the bonuses between 61x and 76x): « on risque d'avoir l'impression de toujours voir la même chose ». A bonus needs spread: the market buys span ×3–5 between their first and third quartile.`,
+  deadBonus: `TOXIC SPINS 2026-09-27, after 10 000 spins played: « énormément de bonus qui paient moins de x50 … 2,5x, 3,4x » — a bonus that ends under a tenth of its average is a dead one; they were made rare (under 5x: 17 % → 3 %) without a floor, paid by the small wins of the base game.`,
+  rtpSplit: `WILD CURRENT 2026-10-05: « base game et bonus à 50/50 du RTP » on a 30 000x game; BUBBLE HEX: 22 % in the base game judged thin for a low-volatility slot. TOXIC SPINS (100 000x) lives at 36/64, LAST LAUGH at 30/70 — above 75 % the base game is only a wait for the bonus.`,
+  baseDry: `WILD CURRENT 2026-10-05 (base at 20 % of paying spins, 80 % dead): « base sans bonus trop sèche … Toxic est une x100k, on est sur une x30k ». The lower the max win, the more the RTP can feed small wins: about 32 % of paying spins at 5 000x (BUBBLE HEX), 27 % at 30 000x, 19–20 % at 100 000x (TOXIC SPINS). Measured on the whole base game, bonuses included.`,
+  anteMaxWin: `TOXIC SPINS 2026-09-27 (BASE 1/13M, HUNT 1/2M: « pourquoi un tel écart »): the ante spends the same share of its RTP on the max win as the base game, so its max win is exactly cost × more frequent (HUNT 3x = 3 × the base odds).`,
+  symbolMix: `Studio rule (UNDEAD KING 2026-10-06, « la distribution low/high symbole : visé 50/50 »): the paying symbols the player sees — the revealed boards of the books, weighted by the lookup table, base game and free spins apart — split 50 % low / 50 % high. Too few highs and the game feels numb (moon_howl 2026-07-24: 18 % highs in the bonus, 86 % of the winning lines low — a symbol's share of the line wins goes with the CUBE of its density). Low / high: the math-sdk names (H* / L*), or the symbol table of the game's front (math.symbols of its game-config.json).`,
+  market: `Studio rule (LAST LAUGH 2026-10-02): « regarde le marché pour tous les modes et essaie d'être dedans » — every figure of a mode inside the middle half (p25–p75) of its peers, the slots the market plays most. Max win on the RARE side: aligned on the peers' median, the max wins looked too frequent (GREEDY GOBLIN). Beyond p10/p90 the mode reads as unlike anything the market plays.`,
 };
 
 export interface FindingsInput {
@@ -130,6 +181,14 @@ export interface FindingsInput {
   pops: ModePopulations[];
   tiers: { report: ModeTiers; spec: TierSpec }[];
   popsError?: string | null;
+  /** Every mode against its market peers (`lib/market.ts`); null while loading or unavailable. */
+  market?: GameMarket | null;
+  /**
+   * Stake agreed that this studio may ship outside the 3★ grid (Degen Lab, LAST LAUGH's
+   * client for its max-win spin): a 3★ overrun is then worth knowing, not a fault. A
+   * studio without that agreement keeps the grid as a rule.
+   */
+  lenient?: boolean;
 }
 
 export function allFindings(input: FindingsInput): Issue[] {
@@ -140,14 +199,41 @@ export function allFindings(input: FindingsInput): Issue[] {
     ladder(mp, out);
     variants(mp, out);
   }
+  baseGame(input, out);
+  symbolMix(input, out);
   shapes(input, out);
   bigWins(input, out);
   anteTiers(input, out);
+  anteMaxWin(input, out);
   acrossModes(input, out);
   celebrations(input, out);
   pool(input, out);
+  marketFindings(input, out);
   data(input, out);
   return mergeAcrossModes(out).sort(bySeverity);
+}
+
+/** Hit rate a base game is expected to have for its max win (log-interpolated on `REF.hitByMax`). */
+export function expectedHit(maxWin: number): number {
+  const pts = REF.hitByMax;
+  if (!(maxWin > 0) || maxWin <= pts[0][0]) return pts[0][1];
+  if (maxWin >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+  for (let i = 1; i < pts.length; i++) {
+    const [x0, y0] = pts[i - 1];
+    const [x1, y1] = pts[i];
+    if (maxWin <= x1) {
+      const t = (Math.log(maxWin) - Math.log(x0)) / (Math.log(x1) - Math.log(x0));
+      return y0 + (y1 - y0) * t;
+    }
+  }
+  return pts[pts.length - 1][1];
+}
+
+/** A spin mode under 10x that mixes plain spins and bonuses, by cost. */
+function spinModes(pops: ModePopulations[]): ModePopulations[] {
+  return pops
+    .filter((mp) => mp.cost < 10 && mp.populations.some((p) => p.kind === 'tier') && mp.populations.some((p) => p.kind === 'nobonus' && p.mean > 0))
+    .sort((a, b) => a.cost - b.cost);
 }
 
 export function bySeverity(a: Issue, b: Issue): number {
@@ -193,8 +279,9 @@ const shortOneIn = (v: number) => (isFinite(v) ? `1 / ${Math.round(v).toLocaleSt
 
 // ── Compliance ───────────────────────────────────────────────────────────────
 
-function compliance({ checks, stats }: FindingsInput, out: Issue[]) {
+function compliance({ checks, stats, lenient }: FindingsInput, out: Issue[]) {
   if (!checks) return;
+  const agreed = lenient ? ' (Stake exceptions agreed for this studio)' : '';
   const perModeMostLikely = stats.some((m) => m.stats.mostLikelyOneIn < REF.mostLikelyMin);
   const sev = (s: string): Severity => (s === 'fail' ? 'blocking' : 'minor');
   let crossReported = false;
@@ -226,8 +313,8 @@ function compliance({ checks, stats }: FindingsInput, out: Issue[]) {
   }
   for (const c of checks.betLevelConstraints) {
     const base = { rule: `star:${c.label}`, category: 'Compliance' as const, mode: null, big: c.value, why: 'Overall Bet Level Compliance: the 2★ and 3★ limits of the Stake report.', target: { view: 'compliance' as const } };
-    if (!c.pass2star && !c.pass3star) out.push({ ...base, severity: 'blocking', title: `${c.label} fails both star tiers`, ref: `2★ ${c.limit2star} · 3★ ${c.limit3star}`, excess: 10, text: `${c.value}: over both limits.` });
-    else if (!c.pass3star) out.push({ ...base, severity: 'serious', title: `${c.label} keeps the game out of 3★`, ref: `3★ ${c.limit3star}`, excess: 5, text: `${c.value}: over the 3★ limit.` });
+    if (!c.pass2star && !c.pass3star) out.push({ ...base, severity: lenient ? 'minor' : 'blocking', title: `${c.label} over the 3★ limit${agreed}`, ref: `2★ ${c.limit2star} · 3★ ${c.limit3star}`, excess: 10, text: `${c.value}: over both limits${lenient ? ' — allowed for this studio, to be confirmed with Stake for this game.' : '.'}` });
+    else if (!c.pass3star) out.push({ ...base, severity: lenient ? 'context' : 'serious', title: `${c.label} keeps the game out of 3★${agreed}`, ref: `3★ ${c.limit3star}`, excess: 5, text: `${c.value}: over the 3★ limit.` });
     else if (!c.pass2star) out.push({ ...base, severity: 'context', title: `${c.label} over the 2★ limit (fine at 3★)`, ref: `2★ ${c.limit2star}`, excess: 1, text: `${c.value} passes 3★ (${c.limit3star}): the game is not eligible for 2★, which does not count as a fail at 3★.` });
   }
 
@@ -263,10 +350,12 @@ function compliance({ checks, stats }: FindingsInput, out: Issue[]) {
 
 // ── Distribution (1-2-5 bands of each mode, from the LUT) ───────────────────
 
-function distribution({ stats }: FindingsInput, out: Issue[]) {
+function distribution({ stats, lenient }: FindingsInput, out: Issue[]) {
   const gameMax = Math.max(0, ...stats.map((m) => m.stats.maxPayout));
   for (const { mode, stats: s } of stats) {
     const d = { category: 'Distribution' as const, mode, target: { view: 'explore' as const, mode, key: 'all' } };
+    // A costly mode whose max win lands 1 in a few thousand: the max win IS the mode's top.
+    const accessible = s.cost >= 10 && s.maxPayoutOneIn <= REF.accessibleMaxWin;
     const bands = s.buckets.filter((b) => b.weight > 0 && !(b.start === 0 && b.end === 0));
     const gaps: string[] = [];
     const steps: { a: (typeof bands)[number]; b: (typeof bands)[number]; r: number; limit: number }[] = [];
@@ -281,9 +370,9 @@ function distribution({ stats }: FindingsInput, out: Issue[]) {
       const limit = last ? REF.stepLast : REF.stepMid;
       const r = a.probability / b.probability;
       if (r > limit) steps.push({ a, b, r, limit });
-      if (last && b.probability > a.probability && b.start >= 1000) {
+      if (last && b.probability > a.probability && b.start >= 1000 && !accessible) {
         const q = b.probability / a.probability;
-        out.push({ ...d, rule: 'polar-top', severity: graded(q), title: `Max win more likely than the whole ${band(a)} band`, big: times(q), ref: 'should be rarer', excess: q, text: `The max-win band (${band(b)}) is ${times(q)} more likely than ${band(a)}.`, why: WHY.polarTop });
+        out.push({ ...d, rule: 'polar-top', severity: q >= 4 ? 'serious' : q >= 2 ? 'minor' : 'context', title: `Max win more likely than the whole ${band(a)} band`, big: times(q), ref: 'should be rarer', excess: q, text: `The max-win band (${band(b)}) is ${times(q)} more likely than ${band(a)}.`, why: WHY.polarTop });
       }
     }
     if (gaps.length) {
@@ -295,7 +384,7 @@ function distribution({ stats }: FindingsInput, out: Issue[]) {
       out.push({
         ...d,
         rule: 'steps',
-        severity: graded(excess),
+        severity: excess < REF.stepTolerance ? 'context' : graded(excess),
         title: `${excess >= 2 ? 'Hole' : 'Steep drop'} in the curve at ${band(w.b)}${steps.length > 1 ? ` (+${steps.length - 1} more)` : ''}`,
         big: times(w.r),
         ref: `vs ${band(w.a)} · ≤ ×${w.limit}`,
@@ -312,8 +401,9 @@ function distribution({ stats }: FindingsInput, out: Issue[]) {
       out.push({
         ...d,
         rule: 'cvar',
-        severity: s.cvar001 >= REF.cvar3Star ? 'serious' : 'minor',
-        title: s.cvar001 >= REF.cvar3Star ? 'Worst 0.1 % over the 3★ CVaR ceiling' : 'Worst 0.1 % close to the 3★ CVaR ceiling',
+        // A per-mode estimate of a game-level Stake aggregate: a fault only where the grid is a rule.
+        severity: s.cvar001 >= REF.cvar3Star && !lenient ? 'minor' : 'context',
+        title: s.cvar001 >= REF.cvar3Star ? `Worst 0.1 % over the 3★ CVaR ceiling${lenient ? ' (Stake exceptions agreed)' : ''}` : 'Worst 0.1 % close to the 3★ CVaR ceiling',
         big: `${fk(Math.round(s.cvar001))}x`,
         ref: `≤ ${fk(REF.cvar3Star)}x (3★)`,
         excess,
@@ -353,7 +443,25 @@ function ladder(mp: ModePopulations, out: Issue[]) {
       out.push({ ...d, rule: 'ladder-freq', severity: 'blocking', title: `${hi.label} not rarer than ${lo.label}`, big: oneIn(hi.oneIn), ref: `vs ${oneIn(lo.oneIn)}`, excess: 10, text: `${hi.label} ${oneIn(hi.oneIn)} · ${lo.label} ${oneIn(lo.oneIn)}.` });
     }
     if (hi.mean <= lo.mean) {
-      out.push({ ...d, rule: 'ladder-mean', severity: 'blocking', title: `${hi.label} pay less on average than ${lo.label}`, big: fx(hi.mean), ref: `vs ${fx(lo.mean)}`, excess: 10, text: `Average ${hi.label} ${fx(hi.mean)} · ${lo.label} ${fx(lo.mean)}.` });
+      const top = i === tiers.length - 1;
+      out.push({
+        ...d,
+        rule: 'ladder-mean',
+        severity: 'blocking',
+        title: top ? `${hi.label}: an extra tier that pays no more than ${lo.label}` : `${hi.label} pay less on average than ${lo.label}`,
+        big: fx(hi.mean),
+        ref: `vs ${fx(lo.mean)}`,
+        excess: 10,
+        text: `Average ${hi.label} ${fx(hi.mean)} · ${lo.label} ${fx(lo.mean)}${top ? ` — ${hi.label} land ${oneIn(hi.oneIn)}: one scatter more than the top bonus needs.` : '.'}`,
+        why: top ? WHY.tierExtra : WHY.ladder,
+      });
+    } else if (mp.cost < 10 && hi.probability < lo.probability && hi.probability / lo.probability > REF.tierCloseness) {
+      const r = hi.probability / lo.probability;
+      const excess = r / REF.tierCloseness;
+      out.push({ ...d, rule: 'ladder-close', severity: r >= 2 / 3 ? 'serious' : 'minor', title: `${hi.label} almost as frequent as ${lo.label}`, big: oneIn(hi.oneIn), ref: `vs ${oneIn(lo.oneIn)} · at most ⅓ as often`, excess, text: `${hi.label} come ${pct(r)} as often as ${lo.label} (${oneIn(hi.oneIn)} vs ${oneIn(lo.oneIn)}); the base game keeps about ×6 between tiers.`, why: WHY.tierClose });
+    }
+    if (tiers.length >= 3 && i === tiers.length - 1 && hi.min < lo.median && hi.min < hi.max) {
+      out.push({ ...d, rule: 'hidden-floor', severity: 'minor', title: `${hi.label} can pay less than a typical ${lo.label} bonus`, big: fx(hi.min), ref: `≥ ${fx(lo.median)} (${lo.label} median)`, excess: lo.median / Math.max(hi.min, 1e-9), text: `The hidden pays from ${fx(hi.min)} (P5 ${fx(quantile(hi, 0.05)?.value ?? hi.min)}) while a typical ${lo.label} bonus pays ${fx(lo.median)}.`, why: WHY.hiddenFloor });
     }
     if (hi.median <= lo.median) {
       out.push({ ...d, rule: 'ladder-median', severity: 'serious', title: `Typical ${hi.label} bonus no better than ${lo.label}`, big: fx(hi.median), ref: `vs ${fx(lo.median)}`, excess: 2, text: `Median ${hi.label} ${fx(hi.median)} · ${lo.label} ${fx(lo.median)}.`, why: 'The higher tier only pays better on average: its typical bonus is not better.' });
@@ -419,11 +527,12 @@ export function distinctPopulations(mp: ModePopulations): Population[] {
   return kept;
 }
 
-function shapes({ pops, stats }: FindingsInput, out: Issue[]) {
+function shapes({ pops, stats, market }: FindingsInput, out: Issue[]) {
   const gameMax = Math.max(0, ...stats.map((m) => m.stats.maxPayout));
   for (const mp of pops) {
     const cost = mp.cost > 0 ? mp.cost : 1;
     const hasTiers = mp.populations.some((p) => p.kind === 'tier');
+    const hasNobonus = mp.populations.some((p) => p.kind === 'nobonus' && p.mean > 0);
     const allBonus = !mp.populations.some((p) => p.kind === 'nobonus') && hasTiers;
     const raised = new Set<string>();
 
@@ -437,7 +546,8 @@ function shapes({ pops, stats }: FindingsInput, out: Issue[]) {
     for (const p of distinctPopulations(mp)) {
       const single = p.min === p.max;
       const isBonus = p.kind === 'tier' || p.kind === 'variant' || (p.kind === 'bonus' && !hasTiers) || (p.kind === 'all' && allBonus);
-      const isFeature = p.kind === 'criteria' && !p.retriggers && p.mean > 0 && p.probability < 0.05;
+      // A plain-spin feature: a criteria family under 1 spin in 10 (a mascot at 1/20 is one — the 5 % cut left it out), never the base game itself.
+      const isFeature = p.kind === 'criteria' && !p.retriggers && p.mean > 0 && p.probability < 0.1 && p.criteria !== 'base game';
       const name = p.kind === 'all' ? 'Purchases' : p.label;
       const mergeKey = (rule: string) => `${rule}:${p.kind === 'all' ? 'all' : p.key}`;
       const speak = (rule: string) => {
@@ -457,7 +567,7 @@ function shapes({ pops, stats }: FindingsInput, out: Issue[]) {
           out.push({
             ...d,
             rule,
-            severity: graded(excess),
+            severity: isBonus ? graded(excess) : 'context',
             category: isBonus ? 'Bonus shape' : 'Features',
             title: `${name}: half pay under ${fx(p.median)}, average ${fx(p.mean)}`,
             big: `${ratio.toFixed(1)}×`,
@@ -489,6 +599,23 @@ function shapes({ pops, stats }: FindingsInput, out: Issue[]) {
           });
         }
       }
+      if (isBonus && !single && p.effectiveOutcomes >= REF.essMin) {
+        const q25 = quantile(p, 0.25)?.value ?? 0;
+        const q75 = quantile(p, 0.75)?.value ?? 0;
+        if (q25 > 0 && q75 / q25 < REF.flatSpread && speak('flat')) {
+          const spread = q75 / q25;
+          const excess = REF.flatSpread / spread;
+          out.push({ ...d, rule: 'flat', severity: spread < 1.2 ? 'serious' : 'minor', category: 'Bonus shape', title: `${name}: most look alike — half land between ${fx(q25)} and ${fx(q75)}`, big: `×${spread.toFixed(2)}`, ref: `P75 ÷ P25 ≥ ${REF.flatSpread}`, excess, text: `P25 ${fx(q25)} · median ${fx(p.median)} · P75 ${fx(q75)} — the middle half of these bonuses spans ×${spread.toFixed(2)}.`, why: WHY.flat, merge: mergeKey('flat'), sig: [spread] });
+        }
+      }
+      if (p.kind === 'tier' && !single && cost < 10 && hasNobonus && p.mean > 0) {
+        const tenth = 0.1 * p.mean;
+        const under = cdfBelow(p, tenth);
+        if (under > REF.deadBonusShare && speak('dead')) {
+          const excess = under / REF.deadBonusShare;
+          out.push({ ...d, rule: 'dead-bonus', severity: graded(excess), category: 'Bonus shape', title: `${name}: ${pct(under)} end under ${fx(tenth)} — a tenth of their average`, big: pct(under), ref: `≤ ${REF.deadBonusShare * 100} %`, excess, text: `${pct(under)} of the ${name} bonuses pay under ${fx(tenth)} (average ${fx(p.mean)}, median ${fx(p.median)}): dead bonuses the player remembers.`, why: WHY.deadBonus, merge: mergeKey('dead'), sig: [under] });
+        }
+      }
       if (isBonus && p.zeroRate > 0 && !(p.kind === 'all' && p.zeroRate >= 0.5) && speak('zero')) {
         out.push({ ...d, rule: 'zero', severity: 'serious', category: 'Bonus shape', title: `${name}: some pay nothing`, big: pct(p.zeroRate), ref: '0 %', excess: 2 + p.zeroRate, text: `${pct(p.zeroRate)} end at 0x.`, why: 'A bonus that ends at 0x.', merge: mergeKey('zero'), sig: [p.zeroRate] });
       }
@@ -506,7 +633,9 @@ function shapes({ pops, stats }: FindingsInput, out: Issue[]) {
         const medCost = p.median / cost;
         if (medCost < REF.buyMedianOverCost || p.profitableRate < REF.buyProfitableMin) {
           const excess = Math.max(REF.buyMedianOverCost / Math.max(medCost, 1e-6), REF.buyProfitableMin / Math.max(p.profitableRate, 1e-6));
-          out.push({ ...d, rule: 'buy-median', severity: graded(excess), category: 'Buys', title: `A typical purchase returns ${medCost.toFixed(2)}× its cost`, big: fx(p.median), ref: `for ${fx(cost)} · market ≈ 0.25×`, excess, text: `${pct(p.profitableRate)} of purchases return at least the cost.`, why: WHY.buy });
+          const row = market?.modes.find((m) => m.mode === mp.mode)?.rows.find((r) => r.key === 'median');
+          const peers = row ? `peers ${row.p25.toFixed(2)}× · ${row.median.toFixed(2)}× · ${row.p75.toFixed(2)}×` : 'market ≈ 0.25–0.5×';
+          out.push({ ...d, rule: 'buy-median', severity: graded(excess), category: 'Buys', title: `A typical purchase returns ${medCost.toFixed(2)}× its cost`, big: fx(p.median), ref: `for ${fx(cost)} · ${peers}`, excess, text: `${pct(p.profitableRate)} of purchases return at least the cost; the studio aims at half the price (LAST LAUGH 2026-10-01).`, why: WHY.buy });
         }
       }
 
@@ -660,7 +789,11 @@ function anteTiers({ pops }: FindingsInput, out: Issue[]) {
 function acrossModes({ pops }: FindingsInput, out: Issue[]) {
   const keys = new Set(pops.flatMap((mp) => mp.populations.filter((p) => p.kind === 'tier').map((p) => p.key)));
   for (const key of keys) {
+    // A mystery (several tiers behind one price) pays its tiers for its price — richer by design
+    // (TOXIC SPINS, WILD CURRENT): it is not compared.
+    const mysteryLike = (mp: ModePopulations) => mp.cost >= 10 && mp.populations.filter((p) => p.kind === 'tier').length >= 2;
     const rows = pops
+      .filter((mp) => !mysteryLike(mp))
       .map((mp) => ({ mode: mp.mode, pop: mp.populations.find((p) => p.key === key) }))
       .filter((r): r is { mode: string; pop: Population } => !!r.pop && r.pop.min < r.pop.max);
     if (rows.length < 2) continue;
@@ -670,16 +803,16 @@ function acrossModes({ pops }: FindingsInput, out: Issue[]) {
       const r = hi.pop.median / lo.pop.median;
       out.push({
         rule: 'same-tier',
-        severity: 'context',
+        severity: r >= 3 ? 'serious' : r >= 2 ? 'minor' : 'context',
         category: 'Across modes',
         mode: hi.mode,
         also: [lo.mode],
         title: `${hi.pop.label} pay ${times(r)} more in ${hi.mode} than in ${lo.mode}`,
         big: `${fx(hi.pop.median)} vs ${fx(lo.pop.median)}`,
-        ref: 'median',
-        excess: r,
-        text: `Averages ${fx(hi.pop.mean)} vs ${fx(lo.pop.mean)}.`,
-        why: 'The same trigger does not feel the same from one mode to another.',
+        ref: `median · ≤ ×${REF.sameTierMedianGap}`,
+        excess: r / REF.sameTierMedianGap,
+        text: `Medians ${fx(hi.pop.median)} vs ${fx(lo.pop.median)} · averages ${fx(hi.pop.mean)} vs ${fx(lo.pop.mean)}${rows.length > 2 ? ` · in ${rows.length} modes: ${rows.map((x) => `${x.mode} ${fx(x.pop.median)}`).join(', ')}` : ''}.`,
+        why: WHY.sameTier,
         target: { view: 'explore', mode: hi.mode, key },
       });
     }
@@ -852,9 +985,166 @@ function pool({ pops, stats }: FindingsInput, out: Issue[]) {
       if (thin.length) {
         const worst = thin.reduce((a, b) => (b.effective < a.effective ? b : a));
         const excess = REF.bandEffectiveMin / Math.max(worst.effective, 1);
-        out.push({ ...d(p.key), rule: 'pool-thin', severity: graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books — the same round comes back after ~${fk(Math.round(repeatsAfter(b)))} spins`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
+        out.push({ ...d(p.key), rule: 'pool-thin', severity: excess < REF.bandEffectiveTolerance ? 'context' : graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books — the same round comes back after ~${fk(Math.round(repeatsAfter(b)))} spins`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
       }
     }
+  }
+}
+
+// ── Base game: how often the bonuses come, what the base game keeps ─────────
+
+/**
+ * Studio targets for the base game of a slot (every client of 2026-10 said the
+ * same): bonuses often, a hidden that stays reachable, a base game that is
+ * not only a wait for the bonus, and a hit rate that follows the max win.
+ */
+function baseGame({ pops, stats }: FindingsInput, out: Issue[]) {
+  for (const mp of spinModes(pops)) {
+    if (mp.cost > 2) continue;
+    const d = (key: string) => ({ mode: mp.mode, category: 'Base game' as const, target: { view: 'explore' as const, mode: mp.mode, key } });
+    const tiers = tiersOf(mp);
+    const bonus = mp.populations.find((p) => p.kind === 'bonus');
+    const nobonus = mp.populations.find((p) => p.kind === 'nobonus');
+
+    if (bonus && bonus.oneIn > REF.anyBonusMax) {
+      const excess = bonus.oneIn / REF.anyBonusMax;
+      out.push({ ...d(bonus.key), rule: 'bonus-rare', severity: excess < REF.bonusRareTolerance ? 'context' : graded(excess), title: 'Bonuses too rare in the base game', big: oneIn(bonus.oneIn), ref: `≤ 1 / ${REF.anyBonusMax} · aim 1 / 150–180`, excess, text: `A bonus, any tier, lands ${oneIn(bonus.oneIn)}${tiers.length ? ` (${tiers.map((t) => `${t.label} ${oneIn(t.oneIn)}`).join(' · ')})` : ''}.`, why: WHY.bonusRare });
+    }
+    if (tiers.length >= 2 && tiers[0].oneIn > REF.firstTierMax) {
+      const t = tiers[0];
+      const excess = t.oneIn / REF.firstTierMax;
+      out.push({ ...d(t.key), rule: 'first-tier-rare', severity: excess < REF.firstTierTolerance ? 'context' : graded(excess), title: `${t.label} too rare`, big: oneIn(t.oneIn), ref: `≤ 1 / ${REF.firstTierMax} · aim 1 / 180–200`, excess, text: `The first bonus tier lands ${oneIn(t.oneIn)}; the studio aims at 1 in 180–200 spins.`, why: WHY.bonusRare });
+    }
+    if (tiers.length >= 3) {
+      const h = tiers[tiers.length - 1];
+      if (h.oneIn > REF.hiddenMax) {
+        const excess = h.oneIn / REF.hiddenMax;
+        out.push({ ...d(h.key), rule: 'hidden-rare', severity: excess < REF.hiddenTolerance ? 'context' : graded(excess), title: `${h.label} (hidden) rarer than 1 / ${REF.hiddenMax.toLocaleString('en-US')}`, big: oneIn(h.oneIn), ref: `1 / 15 000 – 1 / ${REF.hiddenMax.toLocaleString('en-US')}`, excess, text: `The top tier lands ${oneIn(h.oneIn)}; « 1/30 000 c'est trop rare, 1/20 000 max ».`, why: WHY.bonusRare });
+      }
+    }
+    if (bonus && nobonus && bonus.rtpShare > REF.bonusRtpShareMax) {
+      const excess = bonus.rtpShare / REF.bonusRtpShareMax;
+      out.push({ ...d('nobonus'), rule: 'rtp-split', severity: graded(excess), title: `Base game carries only ${pct(1 - bonus.rtpShare)} of the RTP`, big: pct(1 - bonus.rtpShare), ref: `≥ ${Math.round((1 - REF.bonusRtpShareMax) * 100)} % · 50 % on a 30k game`, excess, text: `Bonuses ${pct(bonus.rtpShare)} of the RTP · plain spins ${pct(nobonus.rtpShare)} (${tiers.map((t) => `${t.label} ${pct(t.rtpShare)}`).join(' · ')}).`, why: WHY.rtpSplit });
+    }
+    const s = stats.find((m) => m.mode === mp.mode)?.stats;
+    if (s && s.maxPayout > 0) {
+      const want = expectedHit(s.maxPayout);
+      if (s.hitRate < REF.hitTolerance * want) {
+        const excess = (REF.hitTolerance * want) / Math.max(s.hitRate, 1e-9);
+        const sub = Math.max(0, s.hitRate - s.breakevenRate);
+        out.push({ ...d('all'), rule: 'base-dry', severity: graded(excess), title: `Base game dry: ${fmtPct(s.hitRate, 1)} of spins pay`, big: fmtPct(s.hitRate, 1), ref: `≈ ${fmtPct(want, 0)} for a ${fk(s.maxPayout)}x game`, excess, text: `Dead ${fmtPct(s.zeroRate, 1)} · under the stake ${fmtPct(sub, 1)} · at least the stake ${fmtPct(s.breakevenRate, 1)} — the studio aims at ${fmtPct(want, 0)} of paying spins for this max win.`, why: WHY.baseDry });
+      }
+    }
+  }
+}
+
+/**
+ * Low / high paying symbols on screen, 50/50 in the base game (spin modes) and
+ * in the free spins (every mode that plays them). Fix on the reel strips: swap
+ * lows for highs keeping the relative weights inside each group — the lookup
+ * table keeps the RTP.
+ */
+function symbolMix({ pops }: FindingsInput, out: Issue[]) {
+  for (const mp of pops) {
+    const s = mp.symbols;
+    if (!s) continue;
+    const parts = [
+      { key: 'base', label: 'base game', mix: s.base, applies: mp.cost < 10 },
+      { key: 'fs', label: 'free spins', mix: s.freeSpins, applies: true },
+    ];
+    for (const p of parts) {
+      const n = p.mix.low + p.mix.high;
+      if (!p.applies || !(n > 0)) continue;
+      const high = p.mix.high / n;
+      const off = Math.abs(high - REF.highShare);
+      if (off <= REF.highShareTolerance) continue;
+      const excess = off / REF.highShareTolerance;
+      out.push({
+        rule: `symbols-${p.key}`,
+        severity: graded(excess),
+        category: p.key === 'base' ? 'Base game' : 'Bonus shape',
+        mode: mp.mode,
+        title: `${high < REF.highShare ? 'Few' : 'Too many'} high symbols on screen in the ${p.label}`,
+        big: `${Math.round(high * 100)} % high`,
+        ref: `${Math.round(REF.highShare * 100)} % ± ${Math.round(REF.highShareTolerance * 100)}`,
+        excess,
+        text: `${pct(high)} of the paying symbols revealed in the ${p.label} are high, ${pct(1 - high)} low (weighted by the lookup table). Fix on the reel strips: swap ${high < REF.highShare ? 'lows for highs' : 'highs for lows'}, keeping the relative weights inside each group; the lookup table keeps the RTP.`,
+        why: WHY.symbolMix,
+        target: { view: 'explore', mode: mp.mode, key: 'all' },
+        merge: `symbols-${p.key}`,
+        sig: [high],
+      });
+    }
+  }
+}
+
+/** An ante's max win odds against the base game's, scaled by its cost. */
+function anteMaxWin({ pops, stats }: FindingsInput, out: Issue[]) {
+  const modes = spinModes(pops);
+  if (modes.length < 2) return;
+  const base = modes[0];
+  const bs = stats.find((m) => m.mode === base.mode)?.stats;
+  if (!bs || !isFinite(bs.maxPayoutOneIn)) return;
+  for (const mp of modes.slice(1)) {
+    const s = stats.find((m) => m.mode === mp.mode)?.stats;
+    if (!s || s.maxPayout !== bs.maxPayout || !isFinite(s.maxPayoutOneIn) || mp.cost <= base.cost) continue;
+    const expected = bs.maxPayoutOneIn / (mp.cost / Math.max(base.cost, 1e-9));
+    const ratio = expected / s.maxPayoutOneIn;
+    if (ratio <= REF.anteMaxWinTolerance && ratio >= 1 / REF.anteMaxWinTolerance) continue;
+    const excess = Math.max(ratio, 1 / ratio) / REF.anteMaxWinTolerance;
+    out.push({
+      rule: 'ante-maxwin',
+      severity: graded(excess),
+      category: 'Across modes',
+      mode: mp.mode,
+      title: `Max win ${times(Math.max(ratio, 1 / ratio))} ${ratio > 1 ? 'more' : 'less'} frequent than ${base.mode} would give at ${fx(mp.cost)}`,
+      big: shortOneIn(s.maxPayoutOneIn),
+      ref: `expected ≈ ${shortOneIn(expected)}`,
+      excess,
+      text: `${base.mode} ${shortOneIn(bs.maxPayoutOneIn)} × ${fx(mp.cost)} the cost ⇒ ${shortOneIn(expected)} at the same share of the RTP; ${mp.mode} lands it ${shortOneIn(s.maxPayoutOneIn)}.`,
+      why: WHY.anteMaxWin,
+      target: { view: 'explore', mode: mp.mode, key: 'all' },
+    });
+  }
+}
+
+// ── Market: where each mode stands among the slots the market plays ─────────
+
+function marketFindings({ market }: FindingsInput, out: Issue[]) {
+  if (!market) return;
+  for (const m of market.modes) {
+    const strong: { row: MarketRow; label: string; text: string }[] = [];
+    const mild: string[] = [];
+    for (const row of m.rows) {
+      if (row.key === 'rtp' || inMiddleRow(row)) continue;
+      const spec = FIGURES[row.key];
+      if (!spec) continue;
+      const label = spec.label(m);
+      const more = row.value > row.median;
+      // The max win reads one way: frequent is the fault, rare is a choice.
+      const beyond = row.key === 'pmax' ? (more ? row.value > row.p75 : false) : row.rank >= 1 - REF.marketOutRank || row.rank <= REF.marketOutRank;
+      const text = `${label} ${spec.format(row.value)} — peers ${spec.format(row.p25)} · ${spec.format(row.median)} · ${spec.format(row.p75)} (${position(row, spec)}).`;
+      if (beyond) strong.push({ row, label, text });
+      else mild.push(label);
+    }
+    const target = { view: 'market' as const, mode: m.mode };
+    // The market is a reference, not a rule: a published Degen Lab mode lives beyond p90 on purpose
+    // (HIDDEN 85/15, a max win at 1/2 000). One line per mode, the far-out figures first.
+    const n = strong.length + mild.length;
+    if (!n) continue;
+    out.push({
+      rule: 'market',
+      severity: 'context',
+      category: 'Market',
+      mode: m.mode,
+      title: strong.length ? `${strong.length} figure${strong.length > 1 ? 's' : ''} beyond p10–p90 of its peers${mild.length ? `, ${mild.length} more outside the middle half` : ''}` : `${n} figure${n > 1 ? 's' : ''} outside the peers' middle half`,
+      big: `${n}`,
+      ref: `of ${m.rows.length} · ${m.count} peers`,
+      excess: strong.length + mild.length / 10,
+      text: [...strong.map((s) => s.text), ...(mild.length ? [`Outside the middle half, within p10–p90: ${mild.join(' · ')}.`] : [])].join(' '),
+      why: WHY.market,
+      target,
+    });
   }
 }
 

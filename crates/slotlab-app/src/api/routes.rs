@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
             delete(remove_game).patch(update_game),
         )
         .route("/api/ui/games/{name}/reload", post(reload_game))
+        .route("/api/ui/games/{name}/version", get(game_version))
         .route("/api/ui/games/{name}/stats", get(game_stats))
         .route("/api/ui/games/{name}/bonus-stats", get(bonus_stats))
         .route("/api/ui/games/{name}/mechanics", get(game_mechanics))
@@ -68,6 +69,7 @@ pub async fn blocking<T: Send + 'static>(
 }
 
 /// Uniform API error: { "error": "..." } + status.
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl ApiError {
@@ -256,14 +258,49 @@ async fn reload_game(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let game = state.registry.reload(&name)?;
-    state.books.invalidate_game(&name);
-    // Math changed → automatic re-import.
+    reload_and_import(&state, &name).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Reads the game's files again, drops the books cached in memory and starts
+/// the import when the books on disk changed too. Shared by the Reload
+/// button and the source watcher (`crate::watch_sources`).
+pub async fn reload_and_import(state: &AppState, name: &str) -> Result<(), ApiError> {
+    let (registry, n) = (state.registry.clone(), name.to_string());
+    let game = blocking(move || registry.reload(&n).map_err(ApiError::from)).await?;
+    state.books.invalidate_game(name);
     let (books, g) = (state.books.clone(), game.clone());
     if !blocking(move || Ok(books.is_imported(&g))).await? {
         state.books.start_import(game);
     }
-    Ok(Json(json!({ "ok": true })))
+    let _ = state.events_tx.send(json!({ "type": "reload", "game": name }).to_string());
+    Ok(())
+}
+
+/// What build of the math the panels show: when it was read, whether its
+/// files moved on disk since, whether the books are imported. Polled by
+/// Analyze (cheap: a few `stat`).
+async fn game_version(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let game = state
+        .registry
+        .get(&name)
+        .ok_or_else(|| ApiError::not_found(format!("unknown game: {name}")))?;
+    let ms = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let (books, g) = (state.books.clone(), game.clone());
+    let imported = blocking(move || Ok(books.is_imported(&g))).await?;
+    let importing = matches!(state.books.import_status(&name).map(|s| s.state), Some(crate::books::ImportState::Running));
+    Ok(Json(json!({
+        "game": name,
+        "fingerprint": game.fingerprint.to_string(),
+        "loadedAt": ms(game.loaded_at),
+        "sourceMtime": game.source_mtime().map(ms),
+        "sourceChanged": game.source_changed(),
+        "imported": imported,
+        "importing": importing,
+    })))
 }
 
 async fn game_stats(
@@ -572,6 +609,11 @@ fn book_facts(
                 spins_initial: rec.map_or(0, |b| b.fs_spins_initial),
                 spins_final: rec.map_or(0, |b| b.fs_spins_final),
                 fg_win_x100: rec.and_then(|b| b.fg_win_x100),
+                sym_low: rec.map_or(0, |b| b.sym_low),
+                sym_high: rec.map_or(0, |b| b.sym_high),
+                sym_low_fs: rec.map_or(0, |b| b.sym_low_fs),
+                sym_high_fs: rec.map_or(0, |b| b.sym_high_fs),
+                antic: rec.is_some_and(|b| b.antic),
             }
         })
         .collect()
@@ -710,6 +752,11 @@ fn populations_sync(
             "cost": m.config.cost,
             "imported": imported,
             "populations": pops,
+            // Symboles payants low / high vus par round (LUT) ; null : aucun
+            // plateau lisible ou noms non classés.
+            "symbols": slotlab_core::symbols::seen(&facts),
+            // Anticipations du spin payé (part des rounds, LUT) ; null : aucune.
+            "anticipation": slotlab_core::symbols::anticipation(&facts),
         }));
     }
     Ok(Json(json!({ "game": name, "modes": modes })))

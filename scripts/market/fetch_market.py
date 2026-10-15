@@ -29,6 +29,7 @@ what is new, and a new figure needs no download at all.
 """
 import gzip, io, json, math, os, subprocess, sys, time
 from datetime import date
+import numpy as np
 
 N = 400
 HOME = os.path.expanduser("~")
@@ -66,6 +67,34 @@ def kind_of(cost, zero):
     return "bust" if zero >= 0.25 else "buy"
 
 
+SPINS = 100
+SESSION_STEP = 0.1
+SESSION_CAP = 2.0 * SPINS
+BUST_RETURN = 0.2
+
+
+def short_session(dist, cost, spins=SPINS):
+    """What `spins` rounds give back, in stakes — the exact law of the sum of
+    independent rounds (FFT), as `slotlab_core::session` computes it: quartiles,
+    share of sessions ending ahead, share giving back under 20 %."""
+    bins = int(round(SESSION_CAP / SESSION_STEP)) + 1
+    pmf = np.zeros(bins)
+    W = sum(w for _, w in dist)
+    for x, w in dist:
+        k = min(int(round(max(x / cost, 0.0) / SESSION_STEP)), bins - 1)
+        pmf[k] += w / W
+    support = (bins - 1) * spins + 1
+    size = 1 << (support - 1).bit_length()
+    total = np.fft.irfft(np.fft.rfft(pmf, size) ** spins, size)[:support]
+    total = np.maximum(total, 0.0)
+    total /= total.sum()
+    cum = np.cumsum(total)
+    mass = cum[-1]
+    q = lambda p: float(np.searchsorted(cum, p * mass - 1e-12)) * SESSION_STEP
+    at_least = lambda stakes: float(mass - cum[int(round(stakes / SESSION_STEP)) - 1]) / mass if round(stakes / SESSION_STEP) > 0 else 1.0
+    return {"s100Median": q(0.5), "s100Win": at_least(spins), "s100Bust": 1.0 - at_least(BUST_RETURN * spins)}
+
+
 def figures(dist, cost):
     """dist: sorted [(payout in base bets, weight)]. Figures in stakes."""
     W = sum(w for _, w in dist)
@@ -96,6 +125,18 @@ def figures(dist, cost):
     }
     for t in LADDER:
         f[f"p{t}"] = at(t)
+    # Value in the top 1 % of the weight, from the biggest win down (the
+    # straddling row in part) — « the top 1 % carries … » of SlotLab.
+    target, mass, top = 0.01 * W, 0.0, 0.0
+    for x, w in reversed(dist):
+        if mass >= target:
+            break
+        take = min(w, target - mass)
+        top += take * x
+        mass += take
+    f["top1"] = top / V if V > 0 else 0.0
+    if cost < 10:
+        f.update(short_session(dist, cost))
     return f
 
 

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { fx, pct } from '../../lib/populations';
-  import { errorText } from '../../lib/stores.svelte';
   import {
     FIGURES,
     KIND_LABEL,
@@ -22,37 +21,25 @@
   interface Props {
     game: string;
     selectedMode?: string;
+    /** Read by the page (Analyze) — the findings use the same comparison. */
+    data: GameMarket | null;
+    loading: boolean;
+    error: string | null;
+    /** A new reference landed: read the comparison again. */
+    onReload: () => void;
   }
 
-  const { game, selectedMode = '' }: Props = $props();
+  const { game, selectedMode = '', data, loading, error, onReload }: Props = $props();
 
-  let data = $state<GameMarket | null>(null);
-  let error = $state<string | null>(null);
-  let loading = $state(false);
   let active = $state('');
-  let seq = 0;
 
+  // The pill follows the mode selected on the page (a finding opens its mode).
   $effect(() => {
-    if (game) void load(game);
+    const want = selectedMode;
+    const modes = data?.modes ?? [];
+    if (modes.some((m) => m.mode === want)) active = want;
+    else if (!modes.some((m) => m.mode === active)) active = modes[0]?.mode ?? '';
   });
-
-  async function load(g: string) {
-    const mine = ++seq;
-    loading = true;
-    error = null;
-    try {
-      const r = await fetch(`/api/ui/games/${encodeURIComponent(g)}/market`);
-      const d = await r.json().catch(() => null);
-      if (!r.ok) throw new Error(d?.error ?? `${r.status} ${r.statusText}`);
-      if (mine !== seq) return;
-      data = d;
-      active = d.modes.find((m: { mode: string }) => m.mode === selectedMode)?.mode ?? d.modes[0]?.mode ?? '';
-    } catch (e) {
-      if (mine === seq) error = errorText(e);
-    } finally {
-      if (mine === seq) loading = false;
-    }
-  }
 
   /** The reference is rebuilt every day from the 30-day ranking (server side). */
   interface Refresh {
@@ -73,7 +60,7 @@
       const wasRunning = refresh?.running ?? false;
       refresh = d.refresh;
       // A new reference: read the comparison again.
-      if (wasRunning && !d.refresh.running && game) void load(game);
+      if (wasRunning && !d.refresh.running && game) onReload();
     } catch {
       /* the comparison above stays as it is */
     }

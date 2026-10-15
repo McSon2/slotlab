@@ -220,6 +220,7 @@ impl BooksManager {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let cache = manager.cache_dir_for(&game);
+            let symbols = crate::registry::front_symbols(game.entry.build_dir.as_deref());
             for (i, mode) in game.modes.iter().enumerate() {
                 let progress = Arc::new(ImportProgress::default());
                 {
@@ -242,7 +243,8 @@ impl BooksManager {
                     }
                 }
 
-                let outcome = import::import_mode(&src, &cache, &mode.config.name, fp, progress);
+                let outcome =
+                    import::import_mode(&src, &cache, &mode.config.name, fp, progress, &symbols);
                 // A bet served DURING this mode's import re-opened the OLD
                 // .blocks (same path until the rename) and cached its index +
                 // blocks. Re-invalidate now that the new files are in place.
