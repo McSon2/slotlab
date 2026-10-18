@@ -394,9 +394,9 @@ fn default_language() -> String {
 const STEPS: [&str; 8] = [
     "Checks",
     "Hub version",
-    "Math (index.json + LUT)",
+    "Math (index.json, LUTs, books)",
     "Frontend build",
-    "Books",
+    "Books index",
     "Register on the hub",
     "Cloudflare subdomain",
     "Link check",
@@ -507,10 +507,12 @@ fn run(state: &AppState, req: &StartReq) -> Result<String> {
     // 2/3/4 — files, over the LAN
     ssh(&cfg, &format!("mkdir -p {remote}/publish {remote}/cache {remote}/build"))?;
     d.step(2, StepState::Running, None);
+    // The books go too: the hub reads them in place, through the resume
+    // points sent with the index in step 4.
     let n = rsync(
         &game.entry.publish_dir,
         &format!("{}:{remote}/publish/", cfg.ssh_target),
-        &["--exclude", "*.zst"],
+        &[],
     )?;
     d.step(2, StepState::Done, Some(n));
     d.step(3, StepState::Running, None);
@@ -521,7 +523,7 @@ fn run(state: &AppState, req: &StartReq) -> Result<String> {
     )?;
     d.step(3, StepState::Done, Some(n));
     d.step(4, StepState::Running, None);
-    let n = rsync(&cache_dir, &format!("{}:{remote}/cache/", cfg.ssh_target), &[])?;
+    let n = rsync(&cache_dir, &format!("{}:{remote}/cache/", cfg.ssh_target), CACHE_RSYNC)?;
     d.step(4, StepState::Done, Some(n));
 
     // 5 — the hub picks it up without restarting: sessions in flight survive
@@ -778,8 +780,14 @@ fn rebuild_hub(
         match state.registry.get(&name) {
             Some(g) if state.books.is_imported(&g) => {
                 say(format!("re-sending the books of {name} in the new format…"));
-                let remote = format!("{}/{}/cache/", cfg.remote_dir.trim_end_matches('/'), name);
-                rsync(&state.books.cache_dir_for(&g), &format!("{}:{remote}", cfg.ssh_target), &[])?;
+                let remote = format!("{}/{}", cfg.remote_dir.trim_end_matches('/'), name);
+                // Since index v10 the hub reads the `.zst` themselves.
+                rsync(&g.entry.publish_dir, &format!("{}:{remote}/publish/", cfg.ssh_target), &[])?;
+                rsync(
+                    &state.books.cache_dir_for(&g),
+                    &format!("{}:{remote}/cache/", cfg.ssh_target),
+                    CACHE_RSYNC,
+                )?;
                 resent.push(name);
             }
             _ => missing.push(name),
@@ -875,6 +883,21 @@ fn ssh_out(cfg: &DeployConfig, command: &str) -> Result<String> {
 }
 
 /// Returns a one-line summary of what actually moved.
+/// What the hub needs of a books cache: the indexes and their resume points
+/// (or copy). Not the mechanics (only the Analyze tab reads them, computed on
+/// demand). `--delete` clears what an older SlotLab sent — the `.blocks` copy
+/// of every book, as big as the books — and `--delete-excluded` the `.mech`
+/// it sent too: an excluded file is otherwise protected on the receiving side
+/// (3.5 GB left on the hub by the first v10 publish).
+const CACHE_RSYNC: &[&str] = &[
+    "--delete",
+    "--delete-excluded",
+    "--exclude",
+    "*.mech",
+    "--exclude",
+    "*.tmp",
+];
+
 fn rsync(local: &Path, remote: &str, extra: &[&str]) -> Result<String> {
     let mut src = local.to_string_lossy().to_string();
     if !src.ends_with('/') {

@@ -3,10 +3,10 @@
 //! sinon ça n'a pas de sens »).
 //!
 //! Same selection and figures as `scripts/market/fetch_market.py`: the 400 most
-//! played games of the last 30 days (StakeCruncher, turnover), instant games
-//! apart, then the slots from the top down until they make 90 % of the slot
-//! turnover — whatever their studio — and every active mode of each, read from
-//! its certified lookup table. Distributions are cached in the script's format
+//! played games of the last 30 days (StakeCruncher, turnover), burst and
+//! instant games apart, then the slots from the top down until they make 90 %
+//! of the slot turnover — whatever their studio — and every active mode of
+//! each, read from its certified lookup table. Distributions are cached in the script's format
 //! (`market/cache/dist`): a day's refresh only downloads the games and versions
 //! that are new. The result is written to `market/market.json` and swapped in
 //! live (`slotlab_core::market::install`); the reference built into SlotLab is
@@ -35,7 +35,9 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/53
 const RANKED: usize = 400;
 /// Share of the slot turnover the reference covers, from the most played down.
 const COVERAGE: f64 = 0.90;
-/// Not slots: a studio's hit can be one, and their dozens of modes would swamp the rest.
+/// Not slots: a studio's hit can be one, and their dozens of modes would swamp
+/// the rest. Stake's own burst list (`market::is_burst`) leaves out the games
+/// it files as burst games; these words catch the ones it does not list yet.
 const INSTANT: [&str; 10] = ["keno", "dice", "plinko", "mines", "limbo", "crash", "roulette", "blackjack", "baccarat", "hilo"];
 /// After a failed attempt, the next one waits this long (seconds).
 const RETRY_AFTER: u64 = 6 * 3600;
@@ -302,6 +304,7 @@ fn refresh() -> anyhow::Result<MarketInfo> {
     };
 
     // The slots, most played first, until `COVERAGE` of their turnover.
+    let stake_slug = |it: &Value| it["stake_com_slug"].as_str().unwrap_or("").to_string();
     let mut slots: Vec<(u32, &Value, String)> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
     for (i, it) in ranked.iter().enumerate() {
@@ -310,7 +313,7 @@ fn refresh() -> anyhow::Result<MarketInfo> {
         };
         let g = &cat[&slug];
         let all_modes = g["modes"].as_array().map_or(0, |ms| ms.iter().filter(|m| m["version"].as_i64() == Some(version(g))).count());
-        if INSTANT.iter().any(|k| slug.contains(k)) || all_modes > 40 {
+        if market::is_burst(&stake_slug(it)) || INSTANT.iter().any(|k| slug.contains(k)) || all_modes > 40 {
             excluded.push(format!("{} ({})", it["name"].as_str().unwrap_or("").trim(), it["team_name"].as_str().unwrap_or("")));
             continue;
         }
@@ -367,6 +370,7 @@ fn refresh() -> anyhow::Result<MarketInfo> {
             slug: slug.clone(),
             name: it["name"].as_str().unwrap_or("").trim().to_string(),
             studio: it["team_name"].as_str().unwrap_or("").to_string(),
+            stake: stake_slug(it),
             share: rnd(turn(it) / total),
             mode: mode.clone(),
             cost: d.cost,
@@ -379,7 +383,11 @@ fn refresh() -> anyhow::Result<MarketInfo> {
     let n_slots = rows.iter().map(|r| r.slug.as_str()).collect::<HashSet<_>>().len();
     let out = json!({
         "source": "stakecruncher.com — certified lookup tables of Stake Engine games",
-        "rule": format!("the most played slots of the last 30 days (turnover), up to {:.0}% of the slot turnover of the top {RANKED}", COVERAGE * 100.0),
+        "rule": format!(
+            "the most played slots of the last 30 days (turnover), burst games left out (Stake's list of {}), up to {:.0}% of the slot turnover of the top {RANKED}",
+            market::bursts_fetched(),
+            COVERAGE * 100.0
+        ),
         "studios": studios.len(),
         "slots": n_slots,
         "coverage": rnd(chosen.iter().map(|c| turn(c.1)).sum::<f64>() / total),

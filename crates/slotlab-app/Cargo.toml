@@ -23,6 +23,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rust-embed = { version = "8", optional = true }
 mime_guess = "2"
 zstd = "0.13"
+# Direct dependency for its `links` metadata only: build.rs compiles the zstd
+# resume shim against the very sources zstd-sys builds (`books/zran.rs`).
+zstd-sys = { version = "2.0.16", default-features = false }
 flate2 = "1"
 memmap2 = "0.9"
 lru = "0.12"
@@ -35,6 +38,10 @@ time = "0.3"
 async-stream = "0.3.6"
 futures-core = "0.3.32"
 rayon = "1.12.0"
+memchr = "2"
+
+[build-dependencies]
+cc = "1"
 
 [features]
 default = []

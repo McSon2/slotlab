@@ -40,6 +40,9 @@ pub fn parse(bytes: &[u8]) -> Result<Lut, LutError> {
     if rows.is_empty() {
         return Err(LutError::Empty);
     }
+    // Grown by doubling: up to half of it would stay reserved for as long as
+    // the game is loaded (a hub holds every mode of every game).
+    rows.shrink_to_fit();
     Ok(Lut::new(rows))
 }
 

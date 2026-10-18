@@ -12,9 +12,11 @@
     /** Game clock rate (1 = real time, 0 = frozen), applied by the time
      * warp SlotLab injects into the builds it serves. */
     speed?: number;
+    /** Silences the game (Web Audio and media elements), same channel. */
+    muted?: boolean;
   }
 
-  const { url, width, height, label, game, scale = 1, speed = 1 }: Props = $props();
+  const { url, width, height, label, game, scale = 1, speed = 1, muted = false }: Props = $props();
 
   let frame = $state<HTMLIFrameElement>();
 
@@ -22,16 +24,28 @@
     frame?.contentWindow?.postMessage({ slotlab: 'speed', value: speed }, '*');
   }
 
+  function sendMuted() {
+    frame?.contentWindow?.postMessage({ slotlab: 'mute', value: muted }, '*');
+  }
+
   $effect(() => {
     void speed;
     sendSpeed();
   });
 
+  $effect(() => {
+    void muted;
+    sendMuted();
+  });
+
   // The injected script asks for the rate as soon as it runs, before the
-  // game boots: a reloaded frame starts at the chosen speed.
+  // game boots: a reloaded frame starts at the chosen speed (and mute).
   $effect(() => {
     const onMessage = (e: MessageEvent) => {
-      if (e.source === frame?.contentWindow && e.data?.slotlab === 'speed?') sendSpeed();
+      if (e.source === frame?.contentWindow && e.data?.slotlab === 'speed?') {
+        sendSpeed();
+        sendMuted();
+      }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
@@ -46,6 +60,7 @@
   <div class="frame-head">
     <span>{label}</span>
     <span class="dim num">
+      {#if muted}<span class="speed">muted</span>{/if}
       {#if speed !== 1}<span class="speed">{speed === 0 ? 'paused' : `×${speed}`}</span>{/if}
       {width}×{height}
     </span>

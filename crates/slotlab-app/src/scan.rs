@@ -8,9 +8,8 @@
 //! game's fingerprint. A re-run after a `run.py prod` re-reads everything,
 //! because the fingerprint changed; a re-run before it returns instantly.
 //!
-//! The blocks are decompressed straight from the mmap and NOT put through the
-//! shared cache: a scan reads each block exactly once, and pushing them all
-//! through the LRU would evict what the RGS is serving spins from.
+//! The books are read in parallel, one task per stretch between two resume
+//! points of the books file (`books::zran`), each decoding its stretch once.
 
 use crate::api::routes::ApiError;
 use crate::registry::LoadedGame;
@@ -18,7 +17,6 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use slotlab_core::invariants::{self, Accumulator, ScanParams, ScanReport};
@@ -303,29 +301,9 @@ fn scan_mode(
         }
     }
 
-    // Records grouped by the block that holds them: one decompression per
-    // block, whatever the order the ids come in.
-    let mut by_block: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, rec) in index.books.iter().enumerate() {
-        by_block.entry(rec.block).or_default().push(i);
-    }
-    let mut blocks: Vec<(u32, Vec<usize>)> = by_block.into_iter().collect();
-    blocks.sort_by_key(|(b, _)| *b);
-
     // Shape first, on a sample: the trigger size and the height of the window
     // decide how every later number is counted.
-    let mut sample: Vec<String> = Vec::with_capacity(SHAPE_SAMPLE);
-    for (block, recs) in blocks.iter().take(4) {
-        let raw = books.block_bytes(*block as usize)?;
-        for i in recs.iter().take(SHAPE_SAMPLE / 4) {
-            if let Some(line) = line_of(&raw, &index.books[*i]) {
-                sample.push(line.to_string());
-            }
-        }
-        if sample.len() >= SHAPE_SAMPLE {
-            break;
-        }
-    }
+    let sample = books.first_lines(SHAPE_SAMPLE)?;
     let mut shape = invariants::detect_shape(&sample);
     if params.trigger_scatters > 0 {
         shape.trigger_scatters = params.trigger_scatters;
@@ -341,34 +319,22 @@ fn scan_mode(
         shape.derived = false;
     }
 
-    let acc = blocks
-        .par_iter()
-        .fold(Accumulator::default, |mut acc, (block, recs)| {
-            let Ok(raw) = books.block_bytes(*block as usize) else {
-                return acc;
+    let acc = books.par_fold(
+        Accumulator::default,
+        |acc, i, line| {
+            let Ok(line) = std::str::from_utf8(line) else {
+                return;
             };
-            for i in recs {
-                let rec = &index.books[*i];
-                if let Some(line) = line_of(&raw, rec) {
-                    let w = weight_by_sim.get(&rec.sim_id).copied().unwrap_or(0);
-                    acc.push(line, w, &shape, &params);
-                }
-            }
-            books_done.fetch_add(recs.len() as u64, Ordering::Relaxed);
-            acc
-        })
-        .reduce(Accumulator::default, |mut a, b| {
+            let rec = &index.books[i];
+            let w = weight_by_sim.get(&rec.sim_id).copied().unwrap_or(0);
+            acc.push(line, w, &shape, &params);
+        },
+        |mut a, b| {
             a.merge(&b);
             a
-        });
+        },
+        Some(&books_done),
+    )?;
 
     Ok(acc.finish(mode_name, mode.config.cost, shape, params))
-}
-
-fn line_of<'a>(raw: &'a [u8], rec: &crate::books::format::BookRecord) -> Option<&'a str> {
-    let start = rec.offset_in_block as usize;
-    let end = start + rec.len as usize;
-    std::str::from_utf8(raw.get(start..end)?)
-        .ok()
-        .map(|s| s.trim_end())
 }

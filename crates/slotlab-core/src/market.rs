@@ -8,9 +8,10 @@
 //! not read against a 500 000x one); an ante (« double chance ») with the
 //! antes of the SAME cost — a 3x ante against the slots that have a 3x mode,
 //! the closest max wins first when there are plenty; a buy or an
-//! all-or-nothing mode with those of a close cost. Every figure is in
-//! multiples of the mode's own stake (its cost), computed the same way here
-//! (`figures`) and in the script.
+//! all-or-nothing mode with those of a close cost. A slot is ONE peer, however
+//! many modes of the kind it has (`one_per_slot`), and a burst game is no slot
+//! at all (`is_burst`). Every figure is in multiples of the mode's own stake
+//! (its cost), computed the same way here (`figures`) and in the script.
 //!
 //! The embedded reference is only the fallback: SlotLab rebuilds the market
 //! every day from the 30-day ranking (`slotlab-app/src/market_refresh.rs`)
@@ -21,6 +22,7 @@
 use crate::model::Lut;
 use crate::session;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 
 /// The figures of a mode — the script writes them, `figures` computes them
@@ -94,6 +96,10 @@ pub struct MarketMode {
     pub slug: String,
     pub name: String,
     pub studio: String,
+    /// The game's slug on stake.com, what Stake's burst list is keyed by
+    /// (empty in a dataset built before it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stake: String,
     /// Share of the 30-day turnover (the slot's).
     #[serde(default)]
     pub share: f64,
@@ -133,9 +139,36 @@ struct Dataset {
 static LIVE: RwLock<Option<&'static Dataset>> = RwLock::new(None);
 
 fn prepare(mut d: Dataset) -> Dataset {
-    // A spinning mode that never pays 100 stakes is not a slot to aim at.
-    d.modes.retain(|m| !matches!(m.kind.as_str(), "base" | "ante") || (m.fig.max_mult.max(m.fig.max / m.cost) >= 100.0 && m.fig.hit > 0.0));
+    // A burst game is not a slot, and a spinning mode that never pays 100
+    // stakes is not a slot to aim at.
+    d.modes.retain(|m| !is_burst(&m.stake) && (!matches!(m.kind.as_str(), "base" | "ante") || (m.fig.max_mult.max(m.fig.max / m.cost) >= 100.0 && m.fig.hit > 0.0)));
     d
+}
+
+/// Stake's « Burst Games » group (`data/burst_games.json`): instant games, not
+/// slots, however their lookup tables look (2026-10-16, client: « Angry Balls
+/// n'est pas une slot, c'est un burst game » — with Minedrop 2 and Drop The
+/// Boss, it sat among the slots). stake.com turns a plain HTTP client away,
+/// so the list is read in a browser: `scripts/market/burst_games.js`.
+#[derive(Debug, Deserialize)]
+struct BurstList {
+    fetched: String,
+    slugs: HashSet<String>,
+}
+
+fn bursts() -> &'static BurstList {
+    static LIST: OnceLock<BurstList> = OnceLock::new();
+    LIST.get_or_init(|| serde_json::from_str(include_str!("../data/burst_games.json")).expect("burst_games.json is valid"))
+}
+
+/// A game Stake files as a burst game, by its stake.com slug.
+pub fn is_burst(stake_slug: &str) -> bool {
+    !stake_slug.is_empty() && bursts().slugs.contains(stake_slug)
+}
+
+/// Day of the burst list (YYYY-MM-DD).
+pub fn bursts_fetched() -> &'static str {
+    bursts().fetched.as_str()
 }
 
 fn embedded() -> &'static Dataset {
@@ -206,6 +239,7 @@ pub const SESSION: f64 = 6_000.0;
 pub const BUY_STREAK: i32 = 5;
 /// A costly mode where this share of the rounds pays nothing is all-or-nothing.
 pub const BUST_ZERO: f64 = 0.25;
+/// Fewest peers, in slots (`one_per_slot`).
 const MIN_PEERS: usize = 12;
 
 /// The figures Player feel compares (spinning modes), in display order.
@@ -404,6 +438,38 @@ pub fn peers(max_win: f64) -> Option<Peers> {
     peers_for("base", 1.0, max_win)
 }
 
+/// One mode per slot: of a slot's modes, the one closest to the mode compared
+/// (`key`, smallest first) — a slot is one peer, however many modes of the
+/// kind it has (2026-10-16: the six 1x modes of one game were 6 of the 17
+/// peers of a 5 000x base game, and moved the hit-rate median from 20 % to
+/// 29 %). Kept in the reference's order. The closest mode is in a window
+/// around the anchor whenever any of the slot's modes is, so the windows
+/// then count slots.
+fn one_per_slot(pool: Vec<&'static MarketMode>, key: impl Fn(&MarketMode) -> (f64, f64)) -> Vec<&'static MarketMode> {
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    let mut out: Vec<&'static MarketMode> = Vec::new();
+    for m in pool {
+        match at.get(m.slug.as_str()) {
+            Some(&i) => {
+                let (a, b) = (key(m), key(out[i]));
+                if a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).is_lt() {
+                    out[i] = m;
+                }
+            }
+            None => {
+                at.insert(m.slug.as_str(), out.len());
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// How far `x` is from `anchor`, as a ratio either way (the windows' ×/÷).
+fn apart(x: f64, anchor: f64) -> f64 {
+    (x / anchor).ln().abs()
+}
+
 /// Keeps the modes within ×/÷ f of `anchor` (by `of`), f widening until
 /// there are at least `MIN_PEERS` of them.
 fn widen(pool: Vec<&'static MarketMode>, anchor: f64, first: f64, of: impl Fn(&MarketMode) -> f64) -> Vec<&'static MarketMode> {
@@ -416,8 +482,8 @@ fn widen(pool: Vec<&'static MarketMode>, anchor: f64, first: f64, of: impl Fn(&M
     Vec::new()
 }
 
-/// Peers of a mode, of the same kind:
-///   · base — the max win within ×/÷ 1.3, widened until there are 12;
+/// Peers of a mode, of the same kind, one mode per slot:
+///   · base — the max win within ×/÷ 1.3, widened until there are 12 slots;
 ///   · ante, buy, bust — the SAME cost (±5 %: a 3x ante among the slots with
 ///     a 3x mode, a 100x buy among the 100x buys), then, when there are
 ///     plenty, the closest max wins (×/÷ 1.3 → …); widened on the cost only
@@ -427,19 +493,20 @@ pub fn peers_for(kind: &str, cost: f64, max_win: f64) -> Option<Peers> {
         return None;
     }
     let pool: Vec<&'static MarketMode> = data().modes.iter().filter(|m| m.kind == kind).collect();
+    let near_max = |m: &MarketMode| apart(m.fig.max, max_win);
     let (games, by): (Vec<&MarketMode>, &'static str) = if kind == "base" {
-        (widen(pool, max_win, 1.3, |m| m.fig.max), "max")
+        (widen(one_per_slot(pool, |m| (near_max(m), 0.0)), max_win, 1.3, |m| m.fig.max), "max")
     } else {
         // Narrowed by max win only among the SAME cost: across costs, the
         // commonest price (100x) would crowd out the closest ones.
-        let same: Vec<&MarketMode> = pool.iter().copied().filter(|m| (m.cost / cost - 1.0).abs() <= 0.05).collect();
+        let same = one_per_slot(pool.iter().copied().filter(|m| (m.cost / cost - 1.0).abs() <= 0.05).collect(), |m| (near_max(m), 0.0));
         let near = if same.len() >= 2 * MIN_PEERS { widen(same.clone(), max_win, 1.3, |m| m.fig.max) } else { Vec::new() };
         if near.len() >= MIN_PEERS {
             (near, "cost+max")
         } else if same.len() >= MIN_PEERS {
             (same, "cost")
         } else {
-            (widen(pool, cost, 1.05, |m| m.cost), "cost")
+            (widen(one_per_slot(pool, |m| (apart(m.cost, cost), near_max(m))), cost, 1.05, |m| m.cost), "cost")
         }
     };
     if games.is_empty() {
@@ -725,6 +792,7 @@ pub fn compare_game(modes: &[(String, &Lut, f64)]) -> GameMarket {
 mod tests {
     use super::*;
     use crate::model::LutRow;
+    use serde_json::json;
 
     #[test]
     fn the_reference_loads_and_finds_peers_by_max_win() {
@@ -752,6 +820,28 @@ mod tests {
         // Buys by their price too: a 100x buy among the 100x buys.
         let b = peers_for("buy", 100.0, 25_000.0).expect("100x buys are common");
         assert!(b.games.len() >= MIN_PEERS && b.games.iter().all(|g| g.kind == "buy" && g.cost == 100.0));
+    }
+
+    #[test]
+    fn a_slot_is_one_peer_and_a_burst_game_none() {
+        // However many modes of the kind a slot has, it is one peer…
+        let groups = [peers(2_000.0), peers(5_000.0), peers(20_000.0), peers(100_000.0), peers_for("ante", 3.0, 25_000.0), peers_for("buy", 100.0, 25_000.0), peers_for("bust", 200.0, 10_000.0)];
+        for p in groups.iter().flatten() {
+            let mut slugs: Vec<&str> = p.games.iter().map(|g| g.slug.as_str()).collect();
+            let n = slugs.len();
+            slugs.sort_unstable();
+            slugs.dedup();
+            assert_eq!(slugs.len(), n, "a slot counted twice among the peers ({})", p.by);
+        }
+        // … through the mode closest to the one compared.
+        let mode = |slug: &str, max: f64| -> &'static MarketMode { Box::leak(Box::new(serde_json::from_value(json!({ "rank": 1, "slug": slug, "name": slug, "studio": "S", "max": max, "hit": 0.3 })).unwrap())) };
+        let kept = one_per_slot(vec![mode("a", 3_000.0), mode("b", 9_000.0), mode("a", 4_500.0), mode("a", 6_500.0)], |m| (apart(m.fig.max, 5_000.0), 0.0));
+        assert_eq!(kept.iter().map(|m| (m.slug.as_str(), m.fig.max)).collect::<Vec<_>>(), [("a", 4_500.0), ("b", 9_000.0)]);
+        // A game Stake files as a burst game leaves the reference.
+        assert!(is_burst("coreffectinteractive-angry-balls") && !is_burst("") && !is_burst("no-such-game"));
+        let row = |slug: &str, stake: &str| json!({ "rank": 1, "slug": slug, "name": slug, "studio": "S", "stake": stake, "mode": "base", "max": 5_000.0, "maxMult": 5_000.0, "hit": 0.3 });
+        let d: Dataset = serde_json::from_value(json!({ "source": "", "rule": "", "fetched": "", "modes": [row("angry-balls", "coreffectinteractive-angry-balls"), row("a-slot", "studio-a-slot"), row("old-row", "")] })).unwrap();
+        assert_eq!(prepare(d).modes.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(), ["a-slot", "old-row"]);
     }
 
     #[test]

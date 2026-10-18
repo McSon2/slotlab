@@ -3580,10 +3580,12 @@ dependencies = [
  "axum",
  "axum-server",
  "bincode",
+ "cc",
  "clap",
  "flate2",
  "futures-core",
  "lru",
+ "memchr",
  "memmap2",
  "mime_guess",
  "rand",
@@ -3602,6 +3604,7 @@ dependencies = [
  "tracing-subscriber",
  "xxhash-rust",
  "zstd",
+ "zstd-sys",
 ]
 
 [[package]]

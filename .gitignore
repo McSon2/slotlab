@@ -11,3 +11,4 @@ node_modules/
 
 # Market reference work dir (scripts/market/fetch_market.py)
 .market-cache/
+app-backups/

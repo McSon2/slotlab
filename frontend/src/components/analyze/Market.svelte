@@ -169,13 +169,16 @@
         </table>
       </div>
       <p class="foot">
-        Amber: outside the peers' middle half. Odds are drawn on a log scale, rarer to the left. Every figure is in
+        Amber: outside the peers' middle half. Odds are drawn on a log scale, rarer to the left. A slot counts once,
+        through its mode closest to this one, and burst games are not slots. Every figure is in
         multiples of the mode's own {buyish ? 'price' : 'stake'} ({cur.cost}× the base bet), exactly as for the peers.
         Bonus figures (how often a bonus comes, what it pays) are not in a lookup table alone: Analyze and CrowdSim read them from the books.
       </p>
 
       <details class="peers">
-        <summary>The {cur.peers.length} most played of these {cur.count} peers</summary>
+        <summary>
+          {cur.peers.length < cur.count ? `The ${cur.peers.length} most played of these ${cur.count} peers` : `The ${cur.count} peers, most played first`}
+        </summary>
         <div class="wrap">
           <table class="small">
             <thead>

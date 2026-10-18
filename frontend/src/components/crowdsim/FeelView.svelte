@@ -232,7 +232,7 @@
       Bonus figures are not in a lookup table alone: they have no market column.
     </p>
     <details class="mk-peers">
-      <summary>The {Math.min(mk.peers.length, 15)} most played of these peers</summary>
+      <summary>{mk.peers.length < mk.count ? `The ${mk.peers.length} most played of these ${mk.count} peers` : `The ${mk.count} peers, most played first`}</summary>
       <div class="mk-wrap">
         <table class="mk small">
           <thead>

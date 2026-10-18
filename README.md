@@ -54,10 +54,11 @@ exposed via cloudflared).
 2. **Play** tab → **Install CA** banner (once, macOS password): installs the
    "SlotLab Local CA" into the login keychain so browsers accept
    `https://localhost:3601`.
-3. **Import books** (button, or automatic on the first Launch): re-encodes the
-   `books_*.jsonl.zst` into indexed zstd blocks in
-   `~/Library/Application Support/slotlab/cache/` (~1-3 min for a big game,
-   once only — automatically invalidated if the math changes).
+3. **Import books** (button, or automatic on the first Launch): indexes the
+   `books_*.jsonl.zst` where they are — no copy — into
+   `~/Library/Application Support/slotlab/cache/` (~30 s and ~5 % of the books'
+   size for an eight-mode game, once per build: redone automatically when the
+   math changes, even in the middle of an import).
 4. Launch the game's frontend (`pnpm --filter <game> run dev -- --port 5174`)
    and **Launch**.
 
@@ -102,7 +103,9 @@ exposed via cloudflared).
   place that says whether an RTP, a hit rate or a ceiling is normal here;
   **Market** — every mode against the modes of the same kind of the slots the
   market plays (base games of a close max win, double chances of the SAME
-  cost, bonus buys and all-or-nothing buys of a close price): each figure —
+  cost, bonus buys and all-or-nothing buys of a close price; a slot counts
+  once, through its closest mode, and the games Stake files as burst games —
+  `scripts/market/burst_games.js` — are left out): each figure —
   hit rate, the win ladder, max win odds, 6 000 spins without 500x, median
   return of a buy, share refunding nothing, volatility… — as the peers'
   spread (p10 · middle half p25–p75 · p90), their median, and where the mode
@@ -191,8 +194,8 @@ exposed via cloudflared).
 crates/slotlab-core   # pure (wasm-able): parse index.json/LUT, stats, checks,
                       # crowdsim, review, celebration tiers, book invariants,
                       # preflight rules — all the formulas and all the rules
-crates/slotlab-app    # binary: axum (UI+API, RGS TLS, share), books loader
-                      # (2 MiB zstd blocks + .idx sidecar + mmap + double LRU),
+crates/slotlab-app    # binary: axum (UI+API, RGS TLS, share), books index
+                      # (read in place: zstd resume points + .idx sidecar),
                       # sessions + fault injection, book scan jobs, build
                       # history, rcgen TLS, cloudflared tunnel
 frontend/             # Vite + Svelte 5 + Chart.js (SPA, embedded in release)
@@ -207,15 +210,28 @@ The emulated RGS contract follows the games'
 
 ## Perf notes
 
-The books are **never** loaded whole into RAM: the one-shot import splits
-the stream into 2 MiB zstd frames (`.blocks`) + an index
-sim_id → (block, offset) and search metadata (`.idx`). At read time:
-mmap + LRU of 128 decompressed blocks (~256 MiB) + LRU of parsed books.
-The full Tachyon (16 GB decompressed) runs with ~300 MB of RSS.
+The books are **never** copied nor loaded whole into RAM: SlotLab reads them
+in the game's own `books_<MODE>.jsonl.zst`. That file is ONE zstd frame,
+which normally means decompressing everything before a book to reach it; the
+import decodes it once and, every 64 MiB of books, saves what a zstd decoder
+carries from one block to the next (the 2 MiB window, the Huffman and FSE
+tables, the three repeat offsets — `crates/slotlab-app/csrc/zstd_resume.c`).
+A fresh decoder restored from such a **resume point** reads the original file
+from there (`src/books/zran.rs`). The cache of a mode is its search index
+(`.idx`, compressed) plus these resume points (`.ckpt`, ~3-5 % of the
+`.zst`): Pumpkin Spells went from 8.5 GB of cache to 0.3 GB. Before an index
+is written, every book is read back through the resume points and compared
+with what the import saw; a source that could not be entered that way would
+be copied into independent frames instead (`.zcopy`, never seen so far).
 
-A **book scan** (Scan tab) is the one pass that reads everything: blocks are
-decompressed straight from the mmap, in parallel, and deliberately NOT put
-through the LRU — a scan reads each block exactly once, and pushing them all
-through the cache would evict what the RGS is serving spins from. ~25 s for
-350 000 books, ~3 min for a seven-mode game; the result is kept on disk against
-the build's fingerprint, so it is computed once per `run.py prod`.
+Reaching one book decodes 32 MiB on average: ~15 ms per spin. The import runs
+three modes at a time (one core decodes each, all cores parse the JSON):
+~30 s for Pumpkin Spells' eight modes (92 GB of JSON), against ~100 s when
+every book was re-compressed into blocks. The mechanics of a mode (Analyze →
+Mechanics) are no longer computed at import — they were two thirds of its
+cost — but the first time that tab opens a mode (~5-15 s), then kept.
+
+A **book scan** (Scan tab) and every other pass over all the books run in
+parallel, one task per stretch between two resume points: ~0.7 s to read the
+17 GB of a base game. A scan result is kept on disk against the build's
+fingerprint, so it is computed once per `run.py prod`.

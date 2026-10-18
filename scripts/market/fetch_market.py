@@ -13,8 +13,12 @@ sens » ; the former rule — studios ≥ 1 % of the turnover, then their slots 
 selection every day (`slotlab-app/src/market_refresh.rs`); the work dir is
 SlotLab's own cache by default, so either one downloads only what is new.
 
-Instant games (dice, keno, plinko… — a studio's hit can be one) are left
-out: they are not slots, and their dozens of modes would swamp the rest.
+Burst and instant games are left out: they are not slots, and their dozens of
+modes would swamp the rest. The games Stake files as burst games go by its
+own list (crates/slotlab-core/data/burst_games.json, read in a browser with
+burst_games.js — 2026-10-16, client: « Angry Balls n'est pas une slot, c'est
+un burst game »); the words dice, keno, plinko… catch the ones it does not
+list yet.
 
 Every active mode of those slots is read (base, ante, buys, all-or-nothing
 modes) and written to crates/slotlab-core/data/market.json, embedded in
@@ -39,6 +43,8 @@ COVERAGE = float(sys.argv[2]) if len(sys.argv) > 2 else 0.90
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "crates/slotlab-core/data/market.json")
 RUNTIME = os.path.join(APP, "market", "market.json")
+BURSTS = json.load(open(os.path.join(ROOT, "crates/slotlab-core/data/burst_games.json")))
+BURST = set(BURSTS["slugs"])
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 API = "https://stakecruncher.com/tracker-api/engine"
 REF = "https://stakecruncher.com/slots-tracker"
@@ -159,19 +165,19 @@ def catalog_slug(it):
     return s if s in cat else (s[len(t) + 1:] if s.startswith(t + "-") and s[len(t) + 1:] in cat else None)
 
 
-def instant(slug):
+def instant(slug, it):
     g = cat[slug]
     v = g.get("activeVersion") or max(m["version"] for m in g["modes"])
-    return any(k in slug for k in INSTANT) or len([m for m in g["modes"] if m["version"] == v]) > 40
+    return (it.get("stake_com_slug") or "") in BURST or any(k in slug for k in INSTANT) or len([m for m in g["modes"] if m["version"] == v]) > 40
 
 
-# The slots (instant games apart), most played first, until `COVERAGE` of their turnover.
+# The slots (burst and instant games apart), most played first, until `COVERAGE` of their turnover.
 slots, excluded = [], []
 for r, it in enumerate(ranked, 1):
     slug = catalog_slug(it)
     if not slug:
         continue
-    if instant(slug):
+    if instant(slug, it):
         excluded.append(f"{it['name'].strip()} ({it['team_name']})")
         continue
     slots.append((r, it))
@@ -220,14 +226,14 @@ for rank, it in chosen:
         fig = figures(dist, rec["cost"])
         rows.append({
             "rank": rank, "slug": slug, "name": it["name"].strip(), "studio": it.get("team_name") or "",
-            "share": turn(it) / total, "mode": m["name"], "cost": rec["cost"], "kind": kind_of(rec["cost"], fig["zero"]), **fig,
+            "stake": it.get("stake_com_slug") or "", "share": turn(it) / total, "mode": m["name"], "cost": rec["cost"], "kind": kind_of(rec["cost"], fig["zero"]), **fig,
         })
         print(rank, slug, m["name"], f"cost {rec['cost']:g} {rows[-1]['kind']} max {fig['max']:.0f}", flush=True)
 
 rnd = lambda v: float(f"{v:.6g}")
 out = {
     "source": "stakecruncher.com — certified lookup tables of Stake Engine games",
-    "rule": f"the most played slots of the last 30 days (turnover), up to {COVERAGE:.0%} of the slot turnover of the top {N}",
+    "rule": f"the most played slots of the last 30 days (turnover), burst games left out (Stake's list of {BURSTS['fetched']}), up to {COVERAGE:.0%} of the slot turnover of the top {N}",
     "studios": len({it.get("team_name") for _, it in chosen}),
     "slots": len({r["slug"] for r in rows}),
     "coverage": sum(turn(it) for _, it in chosen) / total,

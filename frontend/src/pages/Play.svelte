@@ -57,6 +57,7 @@
     balance: number;
     scalePct: number;
     customViewports: ViewportPreset[];
+    muted: boolean;
   }
 
   const saved = storageGetJson<Partial<PlayPrefs>>(PREFS_KEY, {});
@@ -78,6 +79,8 @@
   let balance = $state(saved.balance ?? 10000);
   let scalePct = $state(saved.scalePct ?? 60);
   let customViewports = $state<ViewportPreset[]>(saved.customViewports ?? []);
+  /** Silences every frame at once (several viewports = several soundtracks). */
+  let muted = $state(saved.muted ?? false);
   /** Game clock rate, for watching a spin frame by frame. Deliberately not
    * saved: a session that opens slowed down would pass for a broken game. */
   const SPEEDS = [0, 0.05, 0.1, 0.25, 0.5, 1, 2];
@@ -146,7 +149,7 @@
 
   $effect(() => {
     const prefs: PlayPrefs = {
-      activeViewports, currency, social, lang, balance, scalePct, customViewports,
+      activeViewports, currency, social, lang, balance, scalePct, customViewports, muted,
     };
     storageSetJson(PREFS_KEY, prefs);
   });
@@ -822,6 +825,17 @@
           disabled={Boolean(customUrl)}
         />
       </label>
+      <button
+        type="button"
+        class="ghost mute"
+        class:on={muted}
+        aria-pressed={muted}
+        disabled={Boolean(customUrl)}
+        title={customUrl
+          ? 'Only on the build served by SlotLab (the custom URL is not instrumented)'
+          : muted ? 'Sound off in every frame — click to turn it back on' : 'Mute every frame'}
+        onclick={() => (muted = !muted)}
+      ><Icon name={muted ? 'sound-off' : 'sound'} /> {muted ? 'Muted' : 'Sound'}</button>
       <label class="zoom">
         <span>Zoom {scalePct}%</span>
         <input type="range" min="25" max="100" step="5" bind:value={scalePct} />
@@ -1008,6 +1022,7 @@
           label={v.label}
           scale={scalePct / 100}
           {speed}
+          {muted}
         />
       {/each}
     </div>
@@ -1209,6 +1224,14 @@
     gap: 5px;
     margin: 0;
     color: var(--text-faint);
+  }
+
+  .mute {
+    gap: 6px;
+  }
+
+  .mute.on {
+    color: var(--warn);
   }
 
   .zoom .reset {

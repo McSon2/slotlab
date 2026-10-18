@@ -247,6 +247,15 @@ pub async fn run_hub(opts: HubOptions) -> anyhow::Result<()> {
             },
         )),
     };
+    // The hub's container has 1 GB for everything, and the lookup tables of
+    // the published games already take a third of it: every mode's books
+    // held open at once would not fit (1.8 GB for two eight-mode games).
+    // SLOTLAB_BOOKS_MEMORY_MB overrides the share given to open indexes.
+    let open_mb = std::env::var("SLOTLAB_BOOKS_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(300);
+    state.books.limit_memory(open_mb << 20, 8 << 20);
     let n = state.hub.reload(&state)?;
     tracing::info!("hub: {n} game(s) from {}", opts.data_dir.display());
     for g in state.hub.list() {

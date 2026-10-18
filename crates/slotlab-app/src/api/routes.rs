@@ -356,10 +356,7 @@ async fn game_mechanics(
         let (manager, g, m) = (state.books.clone(), game.clone(), q.mode.clone());
         blocking(move || Ok(manager.mode_books(&g, &m)?)).await?
     };
-    let path = state
-        .books
-        .cache_dir_for(&game)
-        .join(format!("books_{}.mech", q.mode));
+    let (manager, mech_game) = (state.books.clone(), game.clone());
     let scope = q.scope.unwrap_or_else(|| "all".into());
     let lut = mode.lut.clone();
     let total = lut.total_weight as f64;
@@ -381,11 +378,13 @@ async fn game_mechanics(
         use slotlab_core::mechanics::{aggregate, key_stat, KeyStatsFile};
         let weight_by_sim: std::collections::HashMap<u64, u64> =
             lut.rows.iter().map(|r| (r.sim_id, r.weight)).collect();
-        let file = crate::books::format::MechFile::read_from(&path)?;
+        // Computed from the books the first time a mode is opened here, then
+        // kept next to its index.
+        let file = manager.mechanics(&mech_game, &mode_name)?;
         anyhow::ensure!(
             file.source_fingerprint == books.index.source_fingerprint
                 && file.mech.offsets.len() == books.index.books.len() + 1,
-            "mechanics cache does not match the books — SlotLab Games tab → Import books"
+            "mechanics do not match the books — SlotLab Games tab → Import books"
         );
         let idx = &books.index;
         let weights: Vec<f64> = idx
@@ -559,7 +558,7 @@ fn bonus_stats_sync(state: &AppState, name: String) -> Result<Json<serde_json::V
         // les portes d'entrée d'un même bonus (`freegame_3`, `wave_3`, un
         // `wincap`…) s'additionnent d'elles-mêmes, et un `mystery_0` qui
         // n'ouvre rien n'y figure pas.
-        let facts = book_facts(lut, idx);
+        let facts = book_facts(lut, idx, &criteria_tiers(&game, &m.config.name));
         let buckets = &m.stats().buckets;
         let prov = provenance::analyze(&facts, m.config.cost, &buckets, &idx.criteria_names);
 
@@ -585,23 +584,55 @@ fn bonus_stats_sync(state: &AppState, name: String) -> Result<Json<serde_json::V
     Ok(Json(json!({ "game": name, "modes": modes })))
 }
 
+/// Palier de chaque criteria d'un mode d'après `library/pool_kinds.json` (écrit par `engine prod` depuis
+/// game.toml / run.py) : `["tier", n]` et `["wincap", [n]]` (un seul palier) ; vide si le fichier manque.
+fn criteria_tiers(game: &crate::registry::LoadedGame, mode: &str) -> std::collections::HashMap<String, u8> {
+    let mut out = std::collections::HashMap::new();
+    let Some(lib) = game.entry.publish_dir.parent() else { return out };
+    let Ok(text) = std::fs::read_to_string(lib.join("pool_kinds.json")) else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return out };
+    if let Some(kinds) = v["kinds"][mode].as_object() {
+        for (crit, k) in kinds {
+            let tier = match (k[0].as_str(), &k[1]) {
+                (Some("tier"), n) => n.as_u64(),
+                (Some("wincap"), serde_json::Value::Array(a)) if a.len() == 1 => a[0].as_u64(),
+                _ => None,
+            };
+            if let Some(t) = tier.filter(|&t| t > 0 && t < 256) {
+                out.insert(crit.clone(), t as u8);
+            }
+        }
+    }
+    out
+}
+
 /// Une entrée par LIGNE DE LUT (poids et gain de la LUT), enrichie de ce que
 /// l'index des books sait du book : bonus, palier, retriggers, criteria,
 /// spins, gain du bonus seul.
 fn book_facts(
     lut: &slotlab_core::model::Lut,
     idx: &crate::books::format::ModeBookIndex,
+    crit_tiers: &std::collections::HashMap<String, u8>,
 ) -> Vec<provenance::BookFacts> {
     lut.rows
         .iter()
         .map(|r| {
             let rec = idx.find(r.sim_id);
+            // Palier lu dans les événements (`freeSpinTrigger`) ; à défaut, celui que la config du jeu donne
+            // à son criteria (`pool_kinds.json`) — un front qui a son propre format d'événements (CRAZY BOMB,
+            // `bonus_start`) n'émet pas `freeSpinTrigger`, ses bonus étaient lus comme des spins de base.
+            let by_crit = rec
+                .filter(|b| b.criteria != u16::MAX)
+                .and_then(|b| idx.criteria_names.get(b.criteria as usize))
+                .and_then(|c| crit_tiers.get(c))
+                .copied();
+            let by_events = rec.is_some_and(|b| b.fs_triggers > 0);
             provenance::BookFacts {
                 sim_id: r.sim_id,
                 weight: r.weight,
                 payout_x100: r.payout_x100,
-                bonus: rec.is_some_and(|b| b.fs_triggers > 0),
-                tier: rec.map_or(0, |b| b.fs_tier),
+                bonus: by_events || by_crit.is_some(),
+                tier: if by_events { rec.map_or(0, |b| b.fs_tier) } else { by_crit.unwrap_or(0) },
                 retriggers: rec.map_or(0, |b| b.fs_retriggers),
                 criteria: rec
                     .filter(|b| b.criteria != u16::MAX)
@@ -728,7 +759,7 @@ fn populations_sync(
     for m in &game.modes {
         let lut = &m.lut;
         let (imported, facts, criteria_names) = match state.books.mode_books(&game, &m.config.name) {
-            Ok(books) => (true, book_facts(lut, &books.index), books.index.criteria_names.clone()),
+            Ok(books) => (true, book_facts(lut, &books.index, &criteria_tiers(&game, &m.config.name)), books.index.criteria_names.clone()),
             Err(_) => (
                 false,
                 lut.rows
@@ -1220,7 +1251,7 @@ fn run_crowdsim_sync(state: &AppState, req: CrowdSimReq) -> Result<Json<serde_js
             .ok_or_else(|| ApiError::not_found(format!("unknown mode: {name}")))?;
         let lut = mode.lut.clone();
         let (facts, criteria, imported) = match state.books.mode_books(&game, &mode.config.name) {
-            Ok(books) => (book_facts(&lut, &books.index), books.index.criteria_names.clone(), true),
+            Ok(books) => (book_facts(&lut, &books.index, &criteria_tiers(&game, &mode.config.name)), books.index.criteria_names.clone(), true),
             Err(_) => (
                 lut.rows
                     .iter()
