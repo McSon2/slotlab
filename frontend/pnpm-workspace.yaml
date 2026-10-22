@@ -2,3 +2,10 @@ packages:
   - .
 allowBuilds:
   esbuild: true
+
+# Correctifs de sécurité des dépendances transitives (audit 2026-10-22)
+overrides:
+  devalue@^5: 5.9.4
+  nanoid@^3: 3.3.20
+  postcss@^8: 8.5.30
+  source-map-js@^1: 1.2.2
