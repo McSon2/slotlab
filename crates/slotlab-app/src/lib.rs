@@ -167,6 +167,7 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
         .merge(games_router())
         .merge(ui_router())
         .layer(ui_cors)
+        .layer(axum::middleware::from_fn(local_only))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], opts.port));
@@ -174,6 +175,82 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
     tracing::info!("SlotLab UI: http://localhost:{}", opts.port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `localhost[:port]` or `127.0.0.1[:port]`.
+fn local_authority(authority: &str) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// The UI API only answers this machine's pages. The 127.0.0.1 bind and the
+/// CORS policy keep other sites from READING answers, but not a DNS-rebinding
+/// domain (it resolves to 127.0.0.1 and becomes same-origin, which would hand
+/// it the filesystem browser and the deploy settings with their tokens), nor
+/// a cross-site form post from triggering an action. So the Host must be a
+/// local name, and so must the Origin when the browser sends one.
+async fn local_only(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    let headers = req.headers();
+    let host_ok = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(local_authority);
+    let origin_ok = headers.get(header::ORIGIN).map_or(true, |v| {
+        v.to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .is_some_and(|(_, rest)| local_authority(rest.split('/').next().unwrap_or("")))
+    });
+    if host_ok && origin_ok {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "only this machine's pages may call SlotLab").into_response()
+    }
+}
+
+#[cfg(test)]
+mod local_only_tests {
+    use super::{local_authority, local_only};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn status(port: u16, headers: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!("POST /x HTTP/1.1\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out.split_whitespace().nth(1).unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_host_and_origin() {
+        let app = axum::Router::new()
+            .route("/x", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(local_only));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(status(port, &format!("Host: 127.0.0.1:{port}\r\n")).await, "200");
+        assert_eq!(status(port, "Host: localhost:5173\r\nOrigin: http://localhost:5173\r\n").await, "200");
+        assert_eq!(status(port, "Host: evil.example:3600\r\n").await, "403");
+        assert_eq!(status(port, &format!("Host: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\n")).await, "403");
+        assert_eq!(status(port, &format!("Host: 127.0.0.1:{port}\r\nOrigin: null\r\n")).await, "403");
+    }
+
+    #[test]
+    fn local_names_only() {
+        for ok in ["localhost", "localhost:3600", "127.0.0.1:5173", "127.0.0.1"] {
+            assert!(local_authority(ok), "{ok}");
+        }
+        for bad in ["evil.example", "evil.example:3600", "localhost.evil.example", "127.0.0.1.nip.io:3600", ""] {
+            assert!(!local_authority(bad), "{bad}");
+        }
+    }
 }
 
 /// Reloads a game as soon as its publish files change on disk (and stop
