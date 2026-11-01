@@ -15,9 +15,9 @@
   --border: oklch(0.3 0.018 165);
   --border-strong: oklch(0.38 0.02 165);
   --text: oklch(0.92 0.012 95);
-  --text-dim: oklch(0.66 0.015 130);
-  /* L 0.6 → 4.7:1 on --bg-panel (AA for the small uppercase labels). */
-  --text-faint: oklch(0.6 0.015 140);
+  --text-dim: oklch(0.74 0.015 130);
+  /* L 0.64 → ~5.4:1 on --bg-panel (AA with room for small labels). */
+  --text-faint: oklch(0.64 0.015 140);
   --row-line: oklch(0.26 0.015 165);
   --row-hover: oklch(0.21 0.015 165);
 
@@ -58,12 +58,12 @@
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 
   /* Type scale — use these, not raw px. */
-  --fs-2xs: 10.5px; /* overlines, table headers, micro labels */
-  --fs-xs: 11.5px; /* captions, pills, hints */
-  --fs-sm: 12.5px; /* buttons, table cells, secondary text */
-  --fs-base: 13.5px; /* body */
-  --fs-md: 14.5px; /* emphasized values, card titles */
-  --fs-lg: 17px; /* section titles */
+  --fs-2xs: 11px; /* overlines, table headers, micro labels */
+  --fs-xs: 12px; /* captions, pills, hints */
+  --fs-sm: 13px; /* buttons, table cells, secondary text */
+  --fs-base: 14px; /* body */
+  --fs-md: 15px; /* emphasized values, card titles */
+  --fs-lg: 18px; /* section titles */
   --fs-xl: 22px; /* page titles, hero numbers */
 
   /* Spacing scale (4px grid). */

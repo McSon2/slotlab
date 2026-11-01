@@ -82,6 +82,23 @@
     { label: 'Ship', tabs: [{ id: 'publish', label: 'Publish', icon: 'publish' }] },
   ];
 
+  /** One line under each page title: what the page answers. */
+  const pageIntro: Record<Tab, string> = {
+    games: 'The games SlotLab knows: where their books are, and what each mode pays.',
+    play: 'Play the build against the emulated RGS, in every screen size at once.',
+    board: 'The board the game shows before the first spin: edit it, check it, write it back.',
+    analyze: 'What a player lives through, mode by mode — and what to fix first.',
+    balance: 'Re-weight the lookup table toward an RTP and a volatility, without new books.',
+    challenge: 'Stake challenges: what each target costs and what it pays the hunter.',
+    crowdsim: 'Thousands of simulated players: how sessions really end.',
+    scan: 'Check every published book against the rules of the game.',
+    preflight: 'Everything Stake reviews, checked before you submit.',
+    assets: 'What the player downloads and what the textures cost in memory.',
+    review: 'The figures to paste into the Stake submission, and a client report.',
+    publish: 'Share a playable link with the team, or publish to the homelab.',
+  };
+  const currentTab = $derived(groups.flatMap((g) => g.tabs).find((t) => t.id === app.tab));
+
   let tlsTrusted = $state(true);
   /** Phone/tablet: the nav collapses behind a menu button. */
   let navOpen = $state(false);
@@ -233,6 +250,12 @@
     </header>
 
     <main class="page" id="main" tabindex="-1">
+      {#if currentTab}
+        <div class="page-head">
+          <h1>{currentTab.label}</h1>
+          <p>{pageIntro[app.tab]}</p>
+        </div>
+      {/if}
       {#if app.error}
         <div class="banner error" role="alert">{app.error}</div>
       {/if}
@@ -467,6 +490,25 @@
 
   main:focus {
     outline: none;
+  }
+
+  .page-head {
+    margin: 0 0 var(--sp-4);
+  }
+
+  .page-head h1 {
+    margin: 0;
+    font-size: var(--fs-xl);
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    line-height: 1.2;
+  }
+
+  .page-head p {
+    margin: 4px 0 0;
+    max-width: 70ch;
+    font-size: var(--fs-base);
+    color: var(--text-dim);
   }
 
   .notices {

@@ -80,6 +80,11 @@
   let scalePct = $state(saved.scalePct ?? 60);
   /** Width available to the viewports: a frame never gets wider than the screen
    * (phone): its zoom drops to fit, the chosen zoom stays the ceiling. */
+  /** Control cards: open on a wide screen, folded on a phone (the games come first). */
+  const wide = typeof matchMedia === 'undefined' || matchMedia('(min-width: 861px)').matches;
+  let openSession = $state(wide);
+  let openForce = $state(wide);
+  let openViewports = $state(wide);
   let framesWidth = $state(0);
   function fitScale(frameWidth: number): number {
     const chosen = scalePct / 100;
@@ -624,13 +629,13 @@
     </div>
   {/if}
 
-  <!-- Two groups that wrap as units: the session setup, then the force form.
-       Separators sit on each group's left edge; the first group of every
-       row has its separator clipped away (see .strip-clip). -->
-  <section class="strip controls-strip" aria-label="Session and force controls">
-    <div class="strip-clip">
-      <div class="strip-row">
-        <div class="group" role="group" aria-label="Session">
+  <!-- Controls: four cards. Session and force are what you touch per test;
+       viewports and display shape what you see. On a phone every card folds. -->
+  <div class="controls">
+    <details class="ctl-card" bind:open={openSession}>
+      <summary><span class="ctl-title">Session</span><span class="ctl-sum">{currency} · {lang} · ${balance}{social ? ' · social' : ''}</span></summary>
+      <div class="ctl-body">
+        <div class="fields" role="group" aria-label="Session">
           <label>
             <span>Currency</span>
             <select bind:value={currency} onchange={launch}>
@@ -658,7 +663,8 @@
             <input type="checkbox" bind:checked={social} onchange={onSocialChange} />
             <span>Social</span>
           </label>
-          <span class="group-actions">
+        </div>
+        <div class="ctl-actions">
             <button onclick={launch} disabled={launches > 0} title="Prepare the sessions and reload every viewport">
               {launches > 0 ? 'Reloading…' : 'Reload'}
             </button>
@@ -667,11 +673,18 @@
               confirmLabel="Reset all sessions?"
               title="New sessions: fresh balance, no open round"
             >Reset sessions</ConfirmButton>
-          </span>
         </div>
+      </div>
+    </details>
 
+    <details class="ctl-card" bind:open={openForce}>
+      <summary>
+        <span class="ctl-title">Force a result</span>
+        <span class="ctl-sum">{forced ? `${forced.mode} #${forced.simId}` : 'random books'}</span>
+      </summary>
+      <div class="ctl-body">
         <form
-          class="group"
+          class="fields"
           aria-label="Force a book"
           onsubmit={(e) => {
             e.preventDefault();
@@ -711,9 +724,8 @@
             </button>
           {/if}
         </form>
-
         {#if poolModes.length > 0}
-          <div class="group" role="group" aria-label="Bonus-only draw">
+          <div class="fields" role="group" aria-label="Bonus-only draw">
             {#each poolModes as o (o.mode)}
               <label title="Each {o.mode} spin draws a random bonus book, weighted like the real game. A forced book wins over it.">
                 <span>{o.mode} · draw</span>
@@ -745,36 +757,38 @@
           </div>
         {/if}
       </div>
-    </div>
-  </section>
+    </details>
 
-  <section class="strip viewports" aria-label="Viewports">
-    <div class="vp-list" role="group" aria-labelledby="vp-label">
-      <span class="strip-label" id="vp-label">Viewports</span>
-      {#each allViewports as v (v.id)}
-        <span class="vp-item">
-          <label class="check">
-            <input
-              type="checkbox"
-              checked={activeViewports.includes(v.id)}
-              onchange={() => toggleViewport(v.id)}
-            />
-            <span>{v.label}</span>
-          </label>
-          {#if v.id.startsWith('custom-')}
-            <button
-              type="button"
-              class="ghost vp-remove"
-              aria-label="Remove viewport {v.label}"
-              title="Remove viewport {v.label}"
-              onclick={() => removeCustomViewport(v.id)}
-            ><Icon name="close" size={11} /></button>
-          {/if}
-        </span>
-      {/each}
-    </div>
-
-    <div class="vp-tools">
+    <details class="ctl-card ctl-wide" bind:open={openViewports}>
+      <summary>
+        <span class="ctl-title">Viewports</span>
+        <span class="ctl-sum">{activeViewports.length} open</span>
+      </summary>
+      <div class="ctl-body">
+        <div class="vp-chips" role="group" aria-label="Viewports">
+          {#each allViewports as v (v.id)}
+            <span class="vp-chip" class:on={activeViewports.includes(v.id)}>
+              <button
+                type="button"
+                aria-pressed={activeViewports.includes(v.id)}
+                onclick={() => toggleViewport(v.id)}
+              >
+                <span class="vp-name">{v.label}</span>
+                <span class="vp-size">{v.width}×{v.height}</span>
+              </button>
+              {#if v.id.startsWith('custom-')}
+                <button
+                  type="button"
+                  class="vp-remove"
+                  aria-label="Remove viewport {v.label}"
+                  title="Remove viewport {v.label}"
+                  onclick={() => removeCustomViewport(v.id)}
+                ><Icon name="close" size={11} /></button>
+              {/if}
+            </span>
+          {/each}
+        </div>
+        <div class="vp-tools">
       <button
         class="ghost"
         title="The {REVIEW_VIEWPORTS.length} viewports the review always opens"
@@ -848,8 +862,10 @@
         <span>Zoom {scalePct}%</span>
         <input type="range" min="25" max="100" step="5" bind:value={scalePct} />
       </label>
-    </div>
-  </section>
+        </div>
+      </div>
+    </details>
+  </div>
 
   <details class="advanced">
     <summary>Custom frontend URL (Vite dev, hot-reload)</summary>
@@ -1089,83 +1105,132 @@
     margin-top: 2px;
   }
 
-  /* ── Control strips: one control height, bottoms flush ─────────────── */
+  /* ── Control cards ─────────────────────────────────────────────────── */
 
-  .strip {
-    --ctrl-h: 32px;
+  .controls {
+    --ctrl-h: 34px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--sp-3);
+    margin-bottom: var(--sp-4);
   }
 
-  .strip :is(select, input:not([type='checkbox']):not([type='range'])),
-  .strip :global(button:not(.vp-remove)) {
+  .ctl-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-m);
+    min-width: 0;
+  }
+
+  .ctl-wide {
+    grid-column: 1 / -1;
+  }
+
+  .ctl-card > summary {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-3);
+    padding: 10px 14px;
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .ctl-card > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .ctl-card > summary::before {
+    content: '';
+    align-self: center;
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid var(--text-faint);
+    border-bottom: 1.5px solid var(--text-faint);
+    transform: rotate(-45deg);
+    transition: transform 0.15s var(--ease-out);
+    flex-shrink: 0;
+  }
+
+  .ctl-card[open] > summary::before {
+    transform: rotate(45deg);
+  }
+
+  .ctl-title {
+    font-size: var(--fs-md);
+    font-weight: 650;
+    color: var(--text);
+  }
+
+  .ctl-sum {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .ctl-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: 2px 14px 14px;
+  }
+
+  .fields {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--sp-3);
+    margin: 0;
+  }
+
+  .controls :is(select, input:not([type='checkbox']):not([type='range'])),
+  .controls :global(button:not(.vp-remove):not(.reset)) {
     height: var(--ctrl-h);
     box-sizing: border-box;
   }
 
-  .strip label {
+  .controls label {
     display: flex;
     flex-direction: column;
     gap: 5px;
+    min-width: 0;
   }
 
-  .strip label > span:first-child {
-    font-size: var(--fs-2xs);
-    line-height: 1;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--text-faint);
+  .controls label > span:first-child {
+    font-size: var(--fs-xs);
+    font-weight: 560;
+    line-height: 1.1;
+    color: var(--text-dim);
     white-space: nowrap;
   }
 
-  .strip label.check {
+  .controls label.check {
     flex-direction: row;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     height: var(--ctrl-h);
+  }
+
+  .controls label.check > span:first-child {
     font-size: var(--fs-sm);
-    color: var(--text-dim);
+    font-weight: 400;
+    color: var(--text);
   }
 
-  .controls-strip {
-    padding-block: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: var(--sp-3);
-  }
-
-  /* Clips the separator of whichever group starts a row; the 4 px of
-     padding keep focus outlines of edge controls visible. */
-  .strip-clip {
-    overflow: hidden;
-    margin: -4px;
-    padding: 4px;
-  }
-
-  .strip-row {
+  .ctl-actions {
     display: flex;
     flex-wrap: wrap;
-    align-items: stretch;
-    gap: var(--sp-3) var(--sp-4);
-    margin-left: calc(-1 * (var(--sp-4) + 1px));
-  }
-
-  .group {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: var(--sp-2) var(--sp-3);
-    padding-left: var(--sp-4);
-    border-left: 1px solid var(--border);
-    margin: 0;
-  }
-
-  .group-actions {
-    display: flex;
     gap: var(--sp-2);
-    margin-left: var(--sp-1);
   }
 
   .pool-note {
     align-self: center;
-    font-size: var(--fs-2xs);
+    font-size: var(--fs-xs);
     color: var(--gold);
   }
 
@@ -1176,62 +1241,86 @@
     color: var(--gold);
   }
 
-  .strip-label {
+  /* Viewports: toggle chips, the size under the name. */
+  .vp-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+  }
+
+  .vp-chip {
     display: inline-flex;
-    align-items: center;
-    height: var(--ctrl-h);
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--r-m);
+    background: var(--bg-deep);
+    overflow: hidden;
+  }
+
+  .vp-chip.on {
+    border-color: color-mix(in oklch, var(--gold) 55%, transparent);
+    background: color-mix(in oklch, var(--gold) 10%, var(--bg-deep));
+  }
+
+  .vp-chip > button:first-child {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 1px;
+    height: auto !important;
+    min-height: 40px;
+    padding: 5px 12px;
+    border: none;
+    border-radius: 0;
+    background: none;
+    text-align: left;
+  }
+
+  .vp-name {
+    font-size: var(--fs-sm);
+    color: var(--text);
+  }
+
+  .vp-chip.on .vp-name {
+    color: var(--gold);
+    font-weight: 620;
+  }
+
+  .vp-size {
+    font-family: var(--font-mono);
     font-size: var(--fs-2xs);
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
     color: var(--text-faint);
-    margin-right: var(--sp-1);
-  }
-
-  /* Viewports: the checkbox list wraps inside its own column; the tools
-     (review pack, custom size, zoom) move under it as one block when the
-     window gets narrow. */
-  .viewports {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: var(--sp-2) var(--sp-6);
-    margin-bottom: var(--sp-1);
-  }
-
-  .vp-list {
-    flex: 1 1 440px;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0 var(--sp-4);
-  }
-
-  .vp-item {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
   }
 
   .vp-remove {
-    padding: 3px;
+    padding: 0 8px;
     line-height: 0;
+    border: none;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    background: none;
   }
 
   .vp-tools {
     display: flex;
     flex-wrap: wrap;
     align-items: flex-end;
-    gap: var(--sp-2) var(--sp-3);
-    margin-left: auto;
+    gap: var(--sp-3) var(--sp-4);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--border);
   }
 
   .custom-add {
     display: flex;
     align-items: center;
-    height: var(--ctrl-h);
     gap: 5px;
     margin: 0;
     color: var(--text-faint);
+  }
+
+  .custom-add input {
+    width: 76px !important;
   }
 
   .mute {
@@ -1242,11 +1331,16 @@
     color: var(--warn);
   }
 
+  .zoom {
+    min-width: 140px;
+  }
+
   .zoom .reset {
     padding: 0 4px;
     margin-left: 4px;
     font-size: var(--fs-xs);
     height: auto;
+    min-height: 0;
   }
 
   .zoom input[type='range'] {
@@ -1255,19 +1349,52 @@
     padding: 0;
   }
 
+  @media (max-width: 860px) {
+    .controls {
+      grid-template-columns: 1fr;
+      gap: var(--sp-2);
+    }
+
+    .controls {
+      --ctrl-h: 42px;
+    }
+
+    .fields > label:not(.check) {
+      flex: 1 1 120px;
+    }
+
+    .fields select,
+    .fields input:not([type='checkbox']) {
+      width: 100% !important;
+    }
+
+    .zoom {
+      flex: 1 1 140px;
+    }
+  }
+
+  /* Secondary tools: quieter than the control cards, same fold. */
   .advanced {
-    margin-bottom: 14px;
+    margin-bottom: var(--sp-2);
+    border: 1px dashed var(--border);
+    border-radius: var(--r-m);
+    padding: 0 14px;
+  }
+
+  .advanced[open] {
+    padding-bottom: 12px;
   }
 
   .advanced summary {
-    font-size: var(--fs-xs);
-    color: var(--text-faint);
+    padding: 9px 0;
+    font-size: var(--fs-sm);
+    color: var(--text-dim);
     cursor: pointer;
     user-select: none;
   }
 
   .advanced summary:hover {
-    color: var(--text-dim);
+    color: var(--text);
   }
 
   .advanced-row {
@@ -1278,6 +1405,7 @@
 
   .advanced-row input {
     flex: 1;
+    min-width: 0;
     max-width: 560px;
   }
 
