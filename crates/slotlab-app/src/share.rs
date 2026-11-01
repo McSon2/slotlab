@@ -171,13 +171,37 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
     // provides the public TLS). The SlotLab UI is NOT exposed.
     // `/play` is the entry point handed out: it mints one session per
     // visitor before redirecting into the game.
+    // Served like a hub game with its console on: Reelhouse's Play tab finds and
+    // forces books through /api/console/*, and its `/k/<code>/…` links open (the
+    // share has no access code, the key is only dropped).
+    let game_entry = Arc::new(crate::hub::HubGame {
+        manifest: crate::hub::Manifest {
+            name: req.game.clone(),
+            host: String::new(),
+            balance: config.balance_micro / 1_000_000,
+            currency: config.currency.clone(),
+            language: config.language.clone(),
+            social: config.social,
+            access_code: String::new(),
+            console: true,
+            published_at: String::new(),
+        },
+        build_dir,
+        gate: Arc::new(crate::gate::Gate::open()),
+        config: config.clone(),
+    });
     let share_app = Router::new()
         .route("/play", get(landing))
         .merge(crate::rgs::routes::router())
-        .fallback_service(tower_http::services::ServeDir::new(build_dir))
+        .merge(crate::console::router())
+        .fallback(crate::hub::serve_static)
+        .layer(Extension(game_entry))
         .layer(Extension(config.clone()))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state.clone());
+    let share_app: Router = Router::new()
+        .fallback_service(share_app)
+        .layer(axum::middleware::from_fn(crate::gate::strip_key));
     let port = share_port();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
