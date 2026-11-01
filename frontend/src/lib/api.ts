@@ -925,8 +925,18 @@ export interface ImportJob {
 /** SlotLab's emulated RGS port (HTTPS). */
 export const RGS_PORT = 3601;
 
+/** UI opened from another machine over HTTPS (e.g. slotlab.mcberry.fr behind Cloudflare Access). */
+function remoteUi(): boolean {
+  if (typeof location === 'undefined' || location.protocol !== 'https:') return false;
+  const h = location.hostname;
+  return !(h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]');
+}
+
 export function rgsUrlFor(game: string): string {
-  return `localhost:${RGS_PORT}/api/rgs/${encodeURIComponent(game)}`;
+  const path = `/api/rgs/${encodeURIComponent(game)}`;
+  // Remote: the UI origin serves the RGS too (the game would look for localhost on the viewer's machine).
+  if (remoteUi()) return `${location.host}${path}`;
+  return `localhost:${RGS_PORT}${path}`;
 }
 
 export interface Feasibility {

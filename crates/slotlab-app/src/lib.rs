@@ -165,6 +165,9 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
         .merge(history::router())
         .merge(report::router())
         .merge(games_router())
+        // RGS émulé aussi sur l'origine de l'UI : ouvert à distance (slotlab.mcberry.fr,
+        // derrière Cloudflare Access), l'onglet Play ne peut pas joindre `localhost:3601`.
+        .merge(rgs::routes::router())
         .merge(ui_router())
         .layer(ui_cors)
         .with_state(state);
