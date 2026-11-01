@@ -627,7 +627,7 @@ progress::-webkit-progress-value {
     display: none;
   }
 
-  img, svg, canvas, video, iframe {
+  img, svg, canvas, video {
     max-width: 100%;
   }
 }
