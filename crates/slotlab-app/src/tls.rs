@@ -125,7 +125,14 @@ fn leaf_not_expiring(path: &std::path::Path) -> bool {
 }
 
 /// Is the CA in the trust store? (`security verify-cert`)
+///
+/// Only macOS can answer: elsewhere (headless server reached through an SSH
+/// tunnel) the browser runs on another machine, whose trust store the server
+/// cannot see, so the banner would always be a false alarm.
 pub fn is_trusted() -> bool {
+    if !cfg!(target_os = "macos") {
+        return certs_dir().join("localhost.pem").exists();
+    }
     let leaf = certs_dir().join("localhost.pem");
     if !leaf.exists() {
         return false;
