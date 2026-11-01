@@ -78,6 +78,14 @@
   let lang = $state(saved.lang ?? 'en');
   let balance = $state(saved.balance ?? 10000);
   let scalePct = $state(saved.scalePct ?? 60);
+  /** Width available to the viewports: a frame never gets wider than the screen
+   * (phone): its zoom drops to fit, the chosen zoom stays the ceiling. */
+  let framesWidth = $state(0);
+  function fitScale(frameWidth: number): number {
+    const chosen = scalePct / 100;
+    if (!framesWidth) return chosen;
+    return Math.min(chosen, (framesWidth - 2) / frameWidth);
+  }
   let customViewports = $state<ViewportPreset[]>(saved.customViewports ?? []);
   /** Silences every frame at once (several viewports = several soundtracks). */
   let muted = $state(saved.muted ?? false);
@@ -1012,7 +1020,7 @@
   {/if}
 
   {#if canPlay && isImported && framesAlive}
-    <div class="frames">
+    <div class="frames" bind:clientWidth={framesWidth}>
       {#each allViewports.filter((v) => activeViewports.includes(v.id)) as v (v.id + '-' + reloadKey)}
         <GameFrame
           url={frameUrl(v.id, v.device)}
@@ -1020,7 +1028,7 @@
           width={v.width}
           height={v.height}
           label={v.label}
-          scale={scalePct / 100}
+          scale={fitScale(v.width)}
           {speed}
           {muted}
         />

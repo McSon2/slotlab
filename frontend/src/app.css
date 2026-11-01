@@ -569,3 +569,65 @@ progress::-webkit-progress-value {
   font-family: var(--font-mono);
   color: var(--text-faint);
 }
+
+/* ---- Phone / small tablet (≤ 860 px) ----
+ * Wide data stays readable: tables scroll sideways inside their own box
+ * instead of pushing the whole page wider than the screen. */
+@media (max-width: 860px) {
+  html, body {
+    overflow-x: hidden;
+  }
+
+  table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table.fixed {
+    table-layout: auto;
+  }
+
+  th, td {
+    padding: 6px 8px;
+  }
+
+  .panel {
+    padding: 14px 12px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  input, select, textarea {
+    font-size: 16px; /* iOS zooms into any field under 16 px */
+    max-width: 100%;
+  }
+
+  button {
+    min-height: 36px;
+  }
+
+  .statline > div {
+    padding: 6px 12px 6px 10px;
+  }
+
+  .view-tabs {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+  }
+
+  .view-tabs button {
+    flex-shrink: 0;
+    padding: 8px 12px;
+  }
+
+  .view-context {
+    display: none;
+  }
+
+  img, svg, canvas, video, iframe {
+    max-width: 100%;
+  }
+}

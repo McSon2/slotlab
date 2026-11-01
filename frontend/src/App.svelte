@@ -83,6 +83,8 @@
   ];
 
   let tlsTrusted = $state(true);
+  /** Phone/tablet: the nav collapses behind a menu button. */
+  let navOpen = $state(false);
   let showOnboarding = $state(false);
   let helpBtn = $state<HTMLButtonElement>();
   /** Play stays mounted once opened: switching tabs must not reload the games. */
@@ -143,8 +145,18 @@
     <div class="brand">
       <span class="chip" aria-hidden="true">SL</span>
       <span class="brand-name">SlotLab</span>
+      <button
+        class="menu-btn"
+        aria-label={navOpen ? 'Close the menu' : 'Open the menu'}
+        aria-expanded={navOpen}
+        aria-controls="main-nav"
+        onclick={() => (navOpen = !navOpen)}
+      >
+        <span class="menu-current">{groups.flatMap((g) => g.tabs).find((t) => t.id === app.tab)?.label ?? ''}</span>
+        <Icon name={navOpen ? 'close' : 'menu'} size={16} />
+      </button>
     </div>
-    <nav aria-label="Main">
+    <nav aria-label="Main" id="main-nav" class:open={navOpen}>
       {#each groups as g (g.label)}
         <div class="nav-group" role="group" aria-labelledby="nav-{g.label}">
           <span class="nav-label" id="nav-{g.label}">{g.label}</span>
@@ -152,7 +164,10 @@
             <button
               class:active={app.tab === t.id}
               aria-current={app.tab === t.id ? 'page' : undefined}
-              onclick={() => (app.tab = t.id)}
+              onclick={() => {
+                app.tab = t.id;
+                navOpen = false;
+              }}
             >
               <Icon name={t.icon} size={15} />
               {t.label}
@@ -499,6 +514,103 @@
   .notice button {
     padding: 4px;
     line-height: 0;
+  }
+
+  .menu-btn {
+    display: none;
+  }
+
+  /* Phone / small tablet: the rail becomes a top bar, the nav a drop-down. */
+  @media (max-width: 860px) {
+    .shell {
+      flex-direction: column;
+    }
+
+    aside {
+      width: 100%;
+      height: auto;
+      padding: 8px var(--sp-3);
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      z-index: 30;
+      overflow: visible;
+    }
+
+    .brand {
+      padding: 0;
+    }
+
+    .menu-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+      min-height: 40px;
+      padding: 6px 12px;
+      border-radius: var(--r-s);
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 620;
+    }
+
+    nav {
+      display: none;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 100%;
+      max-height: calc(100dvh - 60px);
+      overflow-y: auto;
+      padding: var(--sp-3);
+      background: var(--bg-deep);
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 16px 32px oklch(0 0 0 / 0.45);
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: var(--sp-3);
+    }
+
+    nav.open {
+      display: grid;
+    }
+
+    nav button {
+      width: 100%;
+      min-height: 44px;
+      font-size: 15px;
+    }
+
+    .rail-foot {
+      display: none;
+    }
+
+    header {
+      top: 0;
+      padding: 8px var(--sp-3);
+    }
+
+    .cartridge {
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      min-width: 0;
+    }
+
+    .cartridge select {
+      max-width: 100%;
+      font-size: 16px; /* below 16px iOS zooms into the field */
+    }
+
+    main {
+      padding: 14px var(--sp-3) 32px;
+    }
+
+    .notices {
+      left: var(--sp-3);
+      right: var(--sp-3);
+      bottom: var(--sp-3);
+      max-width: none;
+    }
   }
 
   @media (prefers-reduced-motion: no-preference) {
