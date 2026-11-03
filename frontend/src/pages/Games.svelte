@@ -53,7 +53,12 @@
   async function remove(gameName: string) {
     await run(
       async () => {
-        await api.removeGame(gameName);
+        try {
+          await api.removeGame(gameName);
+        } catch (e) {
+          // Already gone on the server (stale list): just resync.
+          if (!/unknown game/i.test(String((e as Error)?.message ?? e))) throw e;
+        }
         await refreshGames();
       },
       { ok: `${gameName} removed from SlotLab`, error: `Could not remove ${gameName}` },

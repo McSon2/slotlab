@@ -622,6 +622,9 @@ export interface HistoryReport {
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json' },
+    // Never a cached answer: behind a proxy (slotlab.mcberry.fr) a stale
+    // games list kept showing games already removed on the server.
+    cache: 'no-store',
     ...init,
   });
   if (!res.ok) {

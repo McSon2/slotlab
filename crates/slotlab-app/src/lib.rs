@@ -169,6 +169,7 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
         // derrière Cloudflare Access), l'onglet Play ne peut pas joindre `localhost:3601`.
         .merge(rgs::routes::router())
         .merge(ui_router())
+        .layer(axum::middleware::map_response(no_store_api))
         .layer(ui_cors)
         .with_state(state);
 
@@ -289,7 +290,7 @@ pub async fn run_hub(opts: HubOptions) -> anyhow::Result<()> {
             state.clone(),
             hub::resolve_mw,
         ))
-        .layer(CorsLayer::permissive())
+.layer(CorsLayer::permissive())
         .with_state(state);
 
     // La clé d'accès portée par l'adresse (`/k/<clé>/…`) est retirée AVANT
@@ -455,4 +456,18 @@ fn ui_router() -> Router<AppState> {
              then open http://localhost:5173"
         }),
     )
+}
+
+/// `/api/*` answers are live state: no browser or proxy may keep a copy.
+async fn no_store_api(
+    uri: axum::http::Uri,
+    mut res: axum::response::Response,
+) -> axum::response::Response {
+    if uri.path().starts_with("/api/") {
+        res.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    res
 }
