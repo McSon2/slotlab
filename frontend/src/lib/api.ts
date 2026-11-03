@@ -670,7 +670,8 @@ export interface GameVersion {
 }
 
 export const api = {
-  listGames: () => request<GameSummary[]>('/api/ui/games'),
+  // Unique URL per call: no edge or browser cache can ever answer with an old list.
+  listGames: () => request<GameSummary[]>(`/api/ui/games?t=${Date.now()}`),
   gameVersion: (name: string) => request<GameVersion>(`/api/ui/games/${encodeURIComponent(name)}/version`),
   /** Every mode against its market peers — cf. `lib/market.ts`. */
   market: (name: string) => request<GameMarket>(`/api/ui/games/${encodeURIComponent(name)}/market`),
