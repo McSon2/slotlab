@@ -347,7 +347,23 @@ fn games_router() -> Router<AppState> {
                 } else {
                     bytes
                 };
-                ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
+                // A rebuilt game must show up on the next load: without a header
+                // the browser caches index.html (and the unhashed assets/…)
+                // heuristically and keeps playing the previous build. Only the
+                // hashed SvelteKit bundles may stay cached.
+                let cache = if rel.starts_with("_app/immutable/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                };
+                (
+                    [
+                        (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                        (header::CACHE_CONTROL, cache.to_string()),
+                    ],
+                    bytes,
+                )
+                    .into_response()
             }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         }
