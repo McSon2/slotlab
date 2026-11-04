@@ -981,11 +981,13 @@ function pool({ pops, stats }: FindingsInput, out: Issue[]) {
       // reached once in billions of spins never repeats in a game's life, whatever its books.
       const lifetime = REF.lifetimeSpins / Math.max(mp.cost, 1);
       const repeatsAfter = (b: Band) => Math.sqrt((Math.PI / 2) * b.effective) / Math.max(b.share * p.probability, 1e-300);
-      const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < REF.bandEffectiveMin && repeatsAfter(b) < lifetime);
+      // Minimum adapted to frequency (2026-11-03): as many effective books as lifetime hits of the band, capped at bandEffectiveMin.
+      const needOf = (b: Band) => Math.min(REF.bandEffectiveMin, lifetime * b.share * p.probability);
+      const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < needOf(b));
       if (thin.length) {
         const worst = thin.reduce((a, b) => (b.effective < a.effective ? b : a));
-        const excess = REF.bandEffectiveMin / Math.max(worst.effective, 1);
-        out.push({ ...d(p.key), rule: 'pool-thin', severity: excess < REF.bandEffectiveTolerance ? 'context' : graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(REF.bandEffectiveMin)}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books — the same round comes back after ~${fk(Math.round(repeatsAfter(b)))} spins`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
+        const excess = needOf(worst) / Math.max(worst.effective, 1);
+        out.push({ ...d(p.key), rule: 'pool-thin', severity: excess < REF.bandEffectiveTolerance ? 'context' : graded(excess), title: `${p.label}: ${fk(Math.round(worst.effective))} effective books in ${label(worst)}`, big: fk(Math.round(worst.effective)), ref: `≥ ${fk(Math.round(needOf(worst)))}`, excess, text: thin.map((b) => `${label(b)}: ${Math.round(b.effective).toLocaleString('en-US')} effective of ${b.books.toLocaleString('en-US')} books for ~${fk(Math.round(lifetime * b.share * p.probability))} hits in the game's life — the same round comes back after ~${fk(Math.round(repeatsAfter(b)))} spins`).join(' · '), why: WHY.poolBands, merge: `pool-thin:${p.label}`, sig: [worst.effective] });
       }
     }
   }

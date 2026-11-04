@@ -42,7 +42,9 @@ pub struct ModeStats {
     pub max_payout_one_in: f64,
     pub buckets: Vec<Bucket>,
     pub top_payouts: Vec<TopPayout>,
-    /// payout_x100 % 10 != 0 somewhere → 0.1x granularity violated.
+    /// Payouts outside the Studio format. Studio (« Math file format ») only asks for whole hundredths of the
+    /// stake (uint64) — 0.01x steps are legal; the old 0.1x rule was the Python SDK's own check (2026-11-03).
+    /// A lookup table parsed as integers can't break it: kept at 0 for the report's shape.
     pub granularity_violations: usize,
     /// What 100 rounds of this mode give back (`session`): spinning modes only
     /// (under 10x) — a run of purchases is not a session.
@@ -89,7 +91,7 @@ pub fn analyze(lut: &Lut, cost: f64) -> ModeStats {
     let mut w_10k: u64 = 0;
     let mut etl40_wp = 0.0_f64;
     let mut etl10k_wp = 0.0_f64;
-    let mut granularity_violations = 0usize;
+    let granularity_violations = 0usize;
 
     let cost_x100 = (cost * 100.0).round() as u64;
 
@@ -117,9 +119,6 @@ pub fn analyze(lut: &Lut, cost: f64) -> ModeStats {
         }
         if r.payout_x100 >= 1_000_000 {
             etl10k_wp += r.weight as f64 * p;
-        }
-        if r.payout_x100 % 10 != 0 {
-            granularity_violations += 1;
         }
     }
 
@@ -415,7 +414,7 @@ mod tests {
         assert!((s.zero_rate - 0.5).abs() < 1e-12);
         assert!((s.breakeven_rate - 0.5).abs() < 1e-12);
         assert_eq!(s.unique_payout_count, 3);
-        assert_eq!(s.granularity_violations, 1); // 2.86x not a multiple of 0.1
+        assert_eq!(s.granularity_violations, 0); // 2.86x: whole hundredths, legal for Studio
     }
 
     #[test]

@@ -320,7 +320,7 @@ pub fn run_game_checks(modes: &[(String, ModeStats, bool)]) -> GameCheckReport {
     let gran = modes.iter().map(|(_, s, _)| s.granularity_violations).sum::<usize>();
     publish.push(mk(
         "granularity",
-        "0.1x granularity (payout×100 % 10 == 0)",
+        "Payouts in whole hundredths of the stake (Studio math file format)",
         gran == 0,
         CheckStatus::Fail,
         format!("{gran} violation(s)"),
