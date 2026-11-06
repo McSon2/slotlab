@@ -582,7 +582,8 @@
   const showMults = $derived(
     !!brush &&
       ('multiplier' in (brushProps[brush] ?? {}) ||
-        !!info?.symbols.find((s) => s.name === brush)?.special.includes('multiplier')),
+        // a coin (wild multiplier, Meat Grinder) carries its value in `multiplier` too
+        !!info?.symbols.find((s) => s.name === brush)?.special.some((p) => p === 'multiplier' || p === 'coin')),
   );
 </script>
 
