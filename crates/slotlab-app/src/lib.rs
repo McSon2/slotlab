@@ -10,6 +10,7 @@ mod gate;
 mod history;
 mod hub;
 mod market_refresh;
+mod muted;
 mod optimize;
 mod persist;
 mod preflight;
@@ -163,6 +164,7 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
         .merge(preflight::router())
         .merge(scan::router())
         .merge(history::router())
+        .merge(muted::router())
         .merge(report::router())
         .merge(games_router())
         // RGS émulé aussi sur l'origine de l'UI : ouvert à distance (slotlab.mcberry.fr,

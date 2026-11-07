@@ -136,6 +136,8 @@ export interface SimResponse {
   scenarios: Cohort[];
 }
 
+/** The one mode a cohort plays (what a « mute in this mode » names); `null` for a mixed session. */
+export const cohortMode = (c: Cohort): string | null => (c.mix.length === 1 ? c.mix[0][0] : null);
 export const metricOf = (c: Cohort, key: string) => c.metrics.find((m) => m.key === key);
 export const shareOf = (c: Cohort, key: string) => c.shares.find((s) => s.key === key)?.value;
 
@@ -170,6 +172,8 @@ export function formatValue(v: number, unit: SimMetric['unit']): string {
 export type SimSeverity = 'serious' | 'minor' | 'lived';
 
 export interface SimFinding {
+  /** Stable key of the reading (`sim:<what>`), never its numbers — what a mute names (`lib/muted.ts`). */
+  key: string;
   severity: SimSeverity;
   title: string;
   big: string;
@@ -213,6 +217,7 @@ export function readCohort(c: Cohort): SimFinding[] {
   const rare = m?.rare.find((r) => r.atLeast >= 1000) ?? m?.rare[m.rare.length - 1];
   if (Math.abs(z) > SIM_REF.rtpZ) {
     out.push({
+      key: 'sim:rtp-noise',
       severity: 'serious',
       title: 'Empirical RTP outside the sampling noise',
       big: rtpPct(c.rtp),
@@ -222,6 +227,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     });
   } else {
     out.push({
+      key: 'sim:rtp-luck',
       severity: 'lived',
       title: `Overall RTP ${gap >= 0 ? 'above' : 'below'} the math by luck of the sample`,
       big: rtpPct(c.rtp),
@@ -236,6 +242,7 @@ export function readCohort(c: Cohort): SimFinding[] {
   // What the median player lives.
   if (rtp) {
     out.push({
+      key: 'sim:median-player',
       severity: 'lived',
       title: `The median player gets back ${rtpPct(rtp.p50)} of what they bet`,
       big: rtpPct(rtp.p50),
@@ -253,6 +260,7 @@ export function readCohort(c: Cohort): SimFinding[] {
   if (feel) {
     for (const f of feel.frustrations.filter((x) => x.severity !== 'ok')) {
       out.push({
+        key: `sim:feel-${f.key}`,
         severity: f.severity === 'serious' ? 'serious' : 'minor',
         title: `${FRUSTRATION_TITLE[f.key]}: ${frustrationSentence(feel, f)}`,
         big: formatFrustration(f.key, f.value),
@@ -267,6 +275,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     const first = metricOf(c, 'firstBonus');
     const bonuses = metricOf(c, 'bonuses');
     out.push({
+      key: 'sim:no-bonus',
       severity: felt(mixed ? 'lived' : none >= SIM_REF.noBonusSerious ? 'serious' : none >= SIM_REF.noBonusMinor ? 'minor' : 'lived'),
       title: mixed
         ? `${bonuses ? bonuses.p50.toFixed(0) : 0} bonuses per player, bought ones included`
@@ -283,6 +292,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     const u10 = bonusPop ? threshold(bonusPop, 10) : undefined;
     if (bonusPop && u10) {
       out.push({
+        key: 'sim:weak-bonus',
         severity: felt(u10.below >= SIM_REF.weakBonusSerious ? 'serious' : u10.below >= SIM_REF.weakBonusMinor ? 'minor' : 'lived'),
         title: `${pct(u10.below)} of the ${mixed ? `${m?.mode} ` : ''}bonuses they saw paid under 10x`,
         big: `median ${fx(bonusPop.median)}`,
@@ -297,6 +307,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     const dry = metricOf(c, 'dead');
     if (dry) {
       out.push({
+        key: 'sim:dry-spell',
         severity: felt(dry.p50 >= SIM_REF.drySpellSerious ? 'serious' : dry.p50 >= SIM_REF.drySpellMinor ? 'minor' : 'lived'),
         title: `Longest run without any win: ${n0(dry.p50)} spins for the median player`,
         big: `${n0(dry.p50)} spins`,
@@ -312,6 +323,7 @@ export function readCohort(c: Cohort): SimFinding[] {
   if (best) {
     const never100 = shareOf(c, 'never100') ?? 0;
     out.push({
+      key: 'sim:best-win',
       severity: 'lived',
       title: `Best win of the median player: ${fx(best.p50)}`,
       big: fx(best.p50),
@@ -325,6 +337,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     const all = m.populations.find((p) => p.kind === 'all');
     if (all) {
       out.push({
+        key: 'sim:buy-median',
         severity: 'lived',
         title: `A typical purchase returns ${(all.median / m.cost).toFixed(2)}× its cost`,
         big: fx(all.median),
@@ -337,6 +350,7 @@ export function readCohort(c: Cohort): SimFinding[] {
     const all = m.populations.find((p) => p.kind === 'all');
     if (all) {
       out.push({
+        key: 'sim:costly-spin',
         severity: 'lived',
         title: `${pct(all.zeroRate)} of the ${fx(m.cost)} spins pay nothing`,
         big: fx(all.median),
@@ -351,6 +365,7 @@ export function readCohort(c: Cohort): SimFinding[] {
   if (busted !== undefined) {
     const rounds = metricOf(c, 'rounds');
     out.push({
+      key: 'sim:busted',
       severity: busted >= 0.5 ? 'minor' : 'lived',
       title: `${pct(busted)} run out of balance`,
       big: rounds ? `${n0(rounds.p50)} spins` : '',
@@ -362,7 +377,7 @@ export function readCohort(c: Cohort): SimFinding[] {
 
   if (c.mix.length > 1) {
     const parts = c.modes.map((mo) => `${mo.mode} ${pct(mo.roundShare)} of the rounds, ${pct(mo.wagered / c.wagered)} of the bets`);
-    out.push({ severity: 'lived', title: 'Mixed session', big: `${c.mix.length} modes`, ref: '', text: parts.join(' · ') + '.', why: '' });
+    out.push({ key: 'sim:mixed', severity: 'lived', title: 'Mixed session', big: `${c.mix.length} modes`, ref: '', text: parts.join(' · ') + '.', why: '' });
   }
 
   const rank: Record<SimSeverity, number> = { serious: 0, minor: 1, lived: 2 };

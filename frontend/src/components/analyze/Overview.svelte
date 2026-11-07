@@ -4,6 +4,10 @@
   import { issuesOf, expectedHit, type Issue, type Severity, type Target } from '../../lib/findings';
   import { rowOf, type GameMarket } from '../../lib/market';
   import Budget from './Budget.svelte';
+  import MuteButton from '../MuteButton.svelte';
+  import MutedList from '../MutedList.svelte';
+  import { canMute, isAnalyzeKey, mutedGroups } from '../../lib/muted';
+  import { mutes } from '../../lib/muted.svelte';
 
   /**
    * The whole game on one screen: what deserves a look (findings computed
@@ -17,6 +21,8 @@
     selectedMode: string;
     /** Everything worth a look — computed by the page (`lib/findings.ts`). */
     issues: Issue[];
+    /** The findings muted for this game (`lib/muted.ts`): out of every count, listed apart. */
+    mutedIssues?: Issue[];
     /** Bonus analysis and celebration ladders loaded: the list is complete. */
     ready: boolean;
     /** Every mode against its market peers (null while loading). */
@@ -25,7 +31,16 @@
     onTarget: (t: Target) => void;
   }
 
-  const { stats, checks, pops, selectedMode, issues, ready, market, onSelectMode, onTarget }: Props = $props();
+  const { stats, checks, pops, selectedMode, issues, mutedIssues = [], ready, market, onSelectMode, onTarget }: Props = $props();
+  const muted = $derived(
+    mutedGroups(
+      mutes.list,
+      mutedIssues,
+      (i) => ({ rule: i.rule, modes: i.mode === null ? [null] : [i.mode, ...(i.also ?? [])], title: i.title }),
+      true,
+      (m) => isAnalyzeKey(m.rule),
+    ),
+  );
 
   const current = $derived(stats.find((m) => m.mode === selectedMode)?.stats);
   const currentPops = $derived(pops.find((m) => m.mode === selectedMode));
@@ -118,7 +133,7 @@
   {#if !ready}
     <p class="pending">Analysing bonuses, variants and celebrations…</p>
   {:else if cards.length === 0}
-    <p class="all-clear">Nothing to report — every rule passes on every mode.</p>
+    <p class="all-clear">Nothing to report — {mutedIssues.length ? 'every rule not muted passes on every mode' : 'every rule passes on every mode'}.</p>
   {:else}
     <div class="wal-cards">
       {#each cards as c (c.mode ?? 'game')}
@@ -154,10 +169,15 @@
                       {#if (it.also?.length ?? 0) > 0 || (it.mode && c.mode !== it.mode)}
                         <span class="faint">Same in {[it.mode, ...(it.also ?? [])].filter((m) => m && m !== c.mode).join(', ')}</span>
                       {/if}
-                      {#if it.target}
-                        {@const t = it.target}
-                        <button class="ghost tiny" onclick={() => onTarget(t)}>Open</button>
-                      {/if}
+                      <span class="foot-actions">
+                        {#if canMute(it.rule, it.severity === 'blocking')}
+                          <MuteButton rule={it.rule} mode={c.mode} />
+                        {/if}
+                        {#if it.target}
+                          {@const t = it.target}
+                          <button class="ghost tiny" onclick={() => onTarget(t)}>Open</button>
+                        {/if}
+                      </span>
                     </div>
                   </div>
                 {/if}
@@ -170,6 +190,9 @@
   {/if}
   {#if ready && clean.length}
     <p class="clean">✓ Nothing to report in {clean.join(', ')}.</p>
+  {/if}
+  {#if ready}
+    <MutedList groups={muted} count={mutedIssues.length} />
   {/if}
 
   <p class="overline gap-lg">Every mode</p>
@@ -486,6 +509,13 @@
     align-items: center;
     justify-content: space-between;
     gap: 10px;
+  }
+
+  .foot-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
   }
 
   .pending {

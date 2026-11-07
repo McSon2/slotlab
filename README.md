@@ -110,6 +110,15 @@ exposed via cloudflared).
   return of a buy, share refunding nothing, volatility… — as the peers'
   spread (p10 · middle half p25–p75 · p90), their median, and where the mode
   falls, with the most played peers listed.
+- **Muted findings** — a rule that makes no sense for a given slot can be
+  muted per game, in one mode or in every mode (« Mute » under an opened
+  finding in Analyze → Overview, Preflight, CrowdSim). Muted findings leave
+  every counter and stay listed, folded, under « N muted findings » with an
+  **Unmute** button. Kept on the server (`<app dir>/muted/<game>.json`,
+  `GET/POST/PUT/DELETE /api/ui/games/{name}/muted`), so the Mac, the remote UI
+  and the CLI report see the same list. Blocking findings (Stake compliance,
+  publish checks, star limits, gaps, most likely book, bonus ladder, the
+  checklist items that already cost a refusal) cannot be muted.
 - **Search** — book search by min/max win, criteria
   (basegame/freegame/wincap…), event type present (freeSpinTrigger…),
   number of retriggers; trigger stats per mode; each hit can be forced or

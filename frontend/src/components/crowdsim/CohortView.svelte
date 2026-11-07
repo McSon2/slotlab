@@ -7,7 +7,10 @@
   import type { FrustrationKey, Payer } from '../../lib/feel';
   import { fx, pct, threshold } from '../../lib/populations';
   import { fmtPct } from '../../lib/api';
-  import { isBuy, kpis, readCohort, tokenColor, type Cohort } from '../../lib/crowdsim';
+  import { cohortMode, isBuy, kpis, readCohort, tokenColor, type Cohort } from '../../lib/crowdsim';
+  import { isSimKey, mutedGroups, splitSim } from '../../lib/muted';
+  import { mutes } from '../../lib/muted.svelte';
+  import MutedList from '../MutedList.svelte';
 
   /** One cohort: key figures, then one section at a time. */
   type Section = 'lived' | 'feel' | 'session' | 'players' | 'bonuses' | 'wins';
@@ -26,7 +29,11 @@
   let section = $state<Section>((() => initial)());
 
   const buy = $derived(isBuy(c));
-  const lines = $derived(readCohort(c));
+  const mode = $derived(cohortMode(c));
+  /** Muted readings (per game, `lib/muted.ts`) listed apart. */
+  const split = $derived(splitSim(readCohort(c), mutes.list, mode));
+  const lines = $derived(split.shown);
+  const mutedHere = $derived(mutedGroups(mutes.list, split.muted, (l) => ({ rule: l.key, modes: [mode], title: l.title }), false, (m) => isSimKey(m.rule)));
   const tiles = $derived(kpis(c));
   const sections = $derived(
     [
@@ -165,7 +172,8 @@
 
 {#if section === 'lived'}
   <div class="card">
-    <Findings {lines} />
+    <Findings {lines} {mode} />
+    <MutedList groups={mutedHere} count={split.muted.length} />
   </div>
 {:else if section === 'feel' && c.feel}
   <FeelView r={c.feel} onsimulate={c.fix ? undefined : onsimulate} {simulating} />

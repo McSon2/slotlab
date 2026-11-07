@@ -16,6 +16,8 @@
   import { storageGetJson, storageSetJson } from '../lib/storage';
   import { fx, oneIn, refId, type ModePopulations, type PopRef } from '../lib/populations';
   import { allFindings, type Target } from '../lib/findings';
+  import { splitIssues } from '../lib/muted';
+  import { mutes } from '../lib/muted.svelte';
   import Overview from '../components/analyze/Overview.svelte';
   import Explore from '../components/analyze/Explore.svelte';
   import Compare from '../components/analyze/Compare.svelte';
@@ -75,6 +77,9 @@
 
   $effect(() => {
     if (app.selectedGame) void load(app.selectedGame);
+  });
+  $effect(() => {
+    if (app.selectedGame) void mutes.load(app.selectedGame);
   });
 
   // ── Per-game conveniences (compare set, extra thresholds) ──
@@ -248,7 +253,10 @@
 
   const current = $derived(stats.find((m) => m.mode === selectedMode)?.stats);
   /** Everything worth a look, over every source SlotLab has for the game. */
-  const issues = $derived(allFindings({ stats, checks, pops, tiers, popsError, market, lenient: compliance === 'lenient' }));
+  const allIssues = $derived(allFindings({ stats, checks, pops, tiers, popsError, market, lenient: compliance === 'lenient' }));
+  /** Muted findings (per game, `lib/muted.ts`) leave every counter; Overview lists them apart. */
+  const split = $derived(splitIssues(allIssues, mutes.game === app.selectedGame ? mutes.list : []));
+  const issues = $derived(split.shown);
   const currentMarket = $derived(market?.modes.find((m) => m.mode === selectedMode));
   const fmtTime = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
   const nBlocking = $derived(issues.filter((i) => i.severity === 'blocking').length);
@@ -531,7 +539,7 @@
   <div id="analyze-panel" role="tabpanel" aria-labelledby="analyze-tab-{view}">
     {#if view === 'overview'}
       <SessionReach game={app.selectedGame ?? ''} mode={selectedMode} market={currentMarket} />
-      <Overview {stats} {checks} {pops} {selectedMode} {issues} {market} ready={analysisReady} onSelectMode={(m) => (selectedMode = m)} onTarget={openTarget} />
+      <Overview {stats} {checks} {pops} {selectedMode} {issues} mutedIssues={split.muted} {market} ready={analysisReady} onSelectMode={(m) => (selectedMode = m)} onTarget={openTarget} />
     {:else if view === 'explore'}
       <section class="page">
         <Explore

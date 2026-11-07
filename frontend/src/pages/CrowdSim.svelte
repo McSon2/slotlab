@@ -4,8 +4,12 @@
   import { fx, pct } from '../lib/populations';
   import CohortView from '../components/crowdsim/CohortView.svelte';
   import Findings from '../components/crowdsim/Findings.svelte';
+  import MutedList from '../components/MutedList.svelte';
+  import { isSimKey, mutedGroups, splitSim } from '../lib/muted';
+  import { mutes } from '../lib/muted.svelte';
   import {
     readCohort,
+    cohortMode,
     compareCohorts,
     metricOf,
     shareOf,
@@ -138,7 +142,18 @@
   const cohortCount = $derived(modes.length + (mixOn && modes.length >= 2 ? 1 : 0));
 
   const cohorts = $derived(result?.scenarios ?? []);
-  const readings = $derived(cohorts.map((c) => ({ c, lines: readCohort(c) })));
+  $effect(() => {
+    if (app.selectedGame) void mutes.load(app.selectedGame);
+  });
+  /** Per cohort, the readings not muted for this game (`lib/muted.ts`); the muted ones leave every count. */
+  const readings = $derived(
+    cohorts.map((c) => {
+      const s = splitSim(readCohort(c), mutes.list, cohortMode(c));
+      return { c, lines: s.shown, muted: s.muted.map((l) => ({ l, mode: cohortMode(c) })) };
+    }),
+  );
+  const mutedAll = $derived(readings.flatMap((r) => r.muted));
+  const mutedSim = $derived(mutedGroups(mutes.list, mutedAll, (x) => ({ rule: x.l.key, modes: [x.mode], title: x.l.title }), true, (m) => isSimKey(m.rule)));
   const comparisons = $derived(compareCohorts(cohorts));
   const count = (lines: { severity: SimSeverity }[], s: SimSeverity) => lines.filter((l) => l.severity === s).length;
 
@@ -386,7 +401,7 @@
                 <div><span>{k.label}</span><b>{k.value}</b></div>
               {/each}
             </div>
-            <Findings lines={issues.length ? issues : lines.slice(0, 2)} />
+            <Findings lines={issues.length ? issues : lines.slice(0, 2)} mode={cohortMode(c)} />
             <div class="ov-actions">
               {#if c.feel?.frustrations.some((f) => f.fix)}
                 <button class="ov-open primary" onclick={() => openCohort(c.name, 'feel')}>See the fixes and what they cost →</button>
@@ -396,6 +411,7 @@
           </section>
         {/each}
       </div>
+      <MutedList groups={mutedSim} count={mutedAll.length} />
       {#each comparisons as sentence (sentence)}<p class="cmp">{sentence}</p>{/each}
     {:else if tab === 'compare'}
       <div class="wrap card-like">

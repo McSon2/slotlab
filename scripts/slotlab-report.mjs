@@ -858,7 +858,6 @@ function pool({ pops, stats }, out) {
       const memorable = Math.max(REF.memorableFrom, REF.memorableFromCost * mp.cost);
       const lifetime = REF.lifetimeSpins / Math.max(mp.cost, 1);
       const repeatsAfter = (b) => Math.sqrt(Math.PI / 2 * b.effective) / Math.max(b.share * p.probability, 1e-300);
-      // Minimum adapted to frequency (2026-11-03): as many effective books as lifetime hits of the band, capped at bandEffectiveMin.
       const needOf = (b) => Math.min(REF.bandEffectiveMin, lifetime * b.share * p.probability);
       const thin = bs.filter((b, i) => i !== maxBand && b.books > 0 && b.start >= memorable && b.effective < needOf(b));
       if (thin.length) {
@@ -1010,6 +1009,38 @@ function data({ pops, popsError }, out) {
     if (!mp.imported) out.push({ rule: "not-imported", severity: "context", category: "Data", mode: mp.mode, title: "Books still importing", big: "", ref: "", excess: 0, text: "Bonus findings appear once the import ends.", why: "" });
   }
 }
+const UNMUTABLE_PREFIXES = ["check:", "publish:", "star:"];
+const UNMUTABLE_RULES = ["gap", "most-likely", "ladder-freq", "ladder-mean", "ante-tier"];
+function canMute(rule, blocking) {
+  if (blocking || !rule) return false;
+  return !UNMUTABLE_PREFIXES.some((p) => rule.startsWith(p)) && !UNMUTABLE_RULES.includes(rule);
+}
+function muteOf(mutes, rule, mode) {
+  return (mode !== null ? mutes.find((m) => m.rule === rule && m.mode === mode) : void 0) ?? mutes.find((m) => m.rule === rule && m.mode === null);
+}
+function splitIssues(issues, mutes) {
+  const out = { shown: [], muted: [] };
+  const withModes = (it, modes) => ({ ...it, mode: modes[0], also: modes.length > 1 ? modes.slice(1) : void 0 });
+  for (const it of issues) {
+    if (!mutes.length || !canMute(it.rule, it.severity === "blocking")) {
+      out.shown.push(it);
+      continue;
+    }
+    if (it.mode === null) {
+      (muteOf(mutes, it.rule, null) ? out.muted : out.shown).push(it);
+      continue;
+    }
+    const modes = [it.mode, ...it.also ?? []];
+    const off = modes.filter((m) => muteOf(mutes, it.rule, m));
+    if (!off.length) out.shown.push(it);
+    else if (off.length === modes.length) out.muted.push(it);
+    else {
+      out.shown.push(withModes(it, modes.filter((m) => !off.includes(m))));
+      out.muted.push(withModes(it, off));
+    }
+  }
+  return out;
+}
 const DEFAULT_BASE = process.env.SLOTLAB_URL ?? "http://localhost:3600";
 async function get(base, path, init) {
   const res = await fetch(base + path, { headers: { "Content-Type": "application/json" }, ...init });
@@ -1032,16 +1063,17 @@ async function waitImported(game, base = DEFAULT_BASE, timeoutMs = 20 * 6e4) {
   }
 }
 async function fetchGame(game, base = DEFAULT_BASE) {
-  const [list, v, s, checks, p, tiers, market] = await Promise.all([
+  const [list, v, s, checks, p, tiers, market, muted] = await Promise.all([
     games(base).catch(() => []),
     version(game, base),
     get(base, `/api/ui/games/${enc(game)}/stats`),
     get(base, `/api/ui/games/${enc(game)}/checks`),
     get(base, `/api/ui/games/${enc(game)}/populations`),
     get(base, `/api/ui/games/${enc(game)}/tiers`).catch(() => null),
-    get(base, `/api/ui/games/${enc(game)}/market`).catch(() => null)
+    get(base, `/api/ui/games/${enc(game)}/market`).catch(() => null),
+    get(base, `/api/ui/games/${enc(game)}/muted`).then((r) => r.muted.map((m) => ({ ...m, mode: m.mode ?? null }))).catch(() => [])
   ]);
-  return { game, summary: list.find((g) => g.name === game), version: v, stats: s.modes, checks, pops: p.modes, tiers, market };
+  return { game, summary: list.find((g) => g.name === game), version: v, stats: s.modes, checks, pops: p.modes, tiers, market, muted };
 }
 function isLenient(d, choice = "auto") {
   if (choice !== "auto") return choice;
@@ -1050,7 +1082,8 @@ function isLenient(d, choice = "auto") {
 const q = (p, v) => p.quantiles.find((x) => Math.abs(x.q - v) < 1e-9)?.value ?? 0;
 function buildReport(d, lenient) {
   const tiers = d.tiers?.modes ?? [];
-  const issues = allFindings({ stats: d.stats, checks: d.checks, pops: d.pops, tiers, market: d.market, lenient });
+  const split = splitIssues(allFindings({ stats: d.stats, checks: d.checks, pops: d.pops, tiers, market: d.market, lenient }), d.muted ?? []);
+  const issues = split.shown;
   const counts = Object.fromEntries(SEVERITIES.map((s) => [s, issues.filter((i) => i.severity === s).length]));
   const modes = d.stats.map(({ mode, stats: s }) => {
     const mp = d.pops.find((m) => m.mode === mode);
@@ -1080,7 +1113,7 @@ function buildReport(d, lenient) {
       marketPeers: mm ? `${mm.count} ${mm.kind} peers, max win ${fx(mm.window[0])}–${fx(mm.window[1])}, cost ${mm.costs[0]}×–${mm.costs[1]}×` : null
     };
   });
-  return { game: d.game, readAt: (/* @__PURE__ */ new Date()).toISOString(), version: d.version, lenient, compliant: d.checks.passed, starTier: d.checks.starTier, counts, issues, modes };
+  return { game: d.game, readAt: (/* @__PURE__ */ new Date()).toISOString(), version: d.version, lenient, compliant: d.checks.passed, starTier: d.checks.starTier, counts, issues, muted: split.muted, modes };
 }
 const n0 = (v) => isFinite(v) ? Math.round(v).toLocaleString("en-US") : "—";
 function toMarkdown(r, opts = {}) {
@@ -1091,7 +1124,7 @@ function toMarkdown(r, opts = {}) {
   L.push(`Compliance: ${r.compliant ? "COMPLIANT" : "FAIL"} · estimated ${r.starTier}★ · 3★ grid ${r.lenient ? "exceptions agreed for this studio (lenient)" : "required (strict)"}`);
   L.push("");
   const faults = r.counts.blocking + r.counts.serious + r.counts.minor;
-  L.push(`## Worth a look — ${faults === 0 ? "nothing: no blocking, serious or minor finding" : `${r.counts.blocking} blocking · ${r.counts.serious} serious · ${r.counts.minor} minor`}${opts.context ? ` · ${r.counts.context} context` : ` (${r.counts.context} context hidden)`}`);
+  L.push(`## Worth a look — ${faults === 0 ? "nothing: no blocking, serious or minor finding" : `${r.counts.blocking} blocking · ${r.counts.serious} serious · ${r.counts.minor} minor`}${opts.context ? ` · ${r.counts.context} context` : ` (${r.counts.context} context hidden)`}${r.muted.length ? ` · ${r.muted.length} muted in the UI (${[...new Set(r.muted.map((i) => i.rule))].join(", ")})` : ""}`);
   const modesShown = [...r.modes.map((m) => m.mode), null].filter((m) => !opts.mode || m === opts.mode || m === null);
   for (const mode of modesShown) {
     const list = issuesOf(r.issues, mode).filter((i) => opts.context || i.severity !== "context");

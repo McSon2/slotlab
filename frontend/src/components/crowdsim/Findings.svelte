@@ -1,13 +1,16 @@
 <script lang="ts">
   import type { SimFinding, SimSeverity } from '../../lib/crowdsim';
+  import MuteButton from '../MuteButton.svelte';
 
   /** Findings of a cohort: one line each, the detail on click. */
   interface Props {
     lines: SimFinding[];
     limit?: number;
+    /** The cohort's mode (`null`: a mixed session) — offers « Mute » on its faults; absent, no button. */
+    mode?: string | null;
   }
 
-  const { lines, limit }: Props = $props();
+  const { lines, limit, mode }: Props = $props();
   let open = $state<number | null>(null);
   const shown = $derived(limit ? lines.slice(0, limit) : lines);
 
@@ -32,6 +35,9 @@
         <div class="more">
           <p>{l.text}</p>
           {#if l.why}<p class="why">{l.why}</p>{/if}
+          {#if mode !== undefined && l.severity !== 'lived'}
+            <div class="mute-row"><MuteButton rule={l.key} {mode} /></div>
+          {/if}
         </div>
       {/if}
     </li>
@@ -39,6 +45,11 @@
 </ul>
 
 <style>
+  .mute-row {
+    display: flex;
+    justify-content: flex-end;
+  }
+
   .findings {
     list-style: none;
     margin: 0;

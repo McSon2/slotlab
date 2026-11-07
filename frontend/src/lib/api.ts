@@ -669,7 +669,25 @@ export interface GameVersion {
   importing: boolean;
 }
 
+/** A muted finding — `slotlab-app/src/muted.rs`. `mode: null` = every mode of the game. */
+export interface MuteEntry {
+  rule: string;
+  mode: string | null;
+  at?: number;
+}
+
 export const api = {
+  muted: (name: string) => request<{ game: string; muted: MuteEntry[] }>(`/api/ui/games/${encodeURIComponent(name)}/muted`),
+  mute: (name: string, rule: string, mode: string | null) =>
+    request<{ game: string; muted: MuteEntry[] }>(`/api/ui/games/${encodeURIComponent(name)}/muted`, {
+      method: 'POST',
+      body: JSON.stringify({ rule, mode }),
+    }),
+  unmute: (name: string, rule: string, mode: string | null) =>
+    request<{ game: string; muted: MuteEntry[] }>(
+      `/api/ui/games/${encodeURIComponent(name)}/muted?rule=${encodeURIComponent(rule)}${mode ? `&mode=${encodeURIComponent(mode)}` : ''}`,
+      { method: 'DELETE' },
+    ),
   // Unique URL per call: no edge or browser cache can ever answer with an old list.
   listGames: () => request<GameSummary[]>(`/api/ui/games?t=${Date.now()}`),
   gameVersion: (name: string) => request<GameVersion>(`/api/ui/games/${encodeURIComponent(name)}/version`),

@@ -8,6 +8,10 @@
   // finding nobody can locate is a finding nobody acts on.
   import { api, type PreflightReport, type PreflightFinding } from '../lib/api';
   import { app } from '../lib/stores.svelte';
+  import { isPreflightKey, mutedGroups, splitBy } from '../lib/muted';
+  import { mutes } from '../lib/muted.svelte';
+  import MuteButton from '../components/MuteButton.svelte';
+  import MutedList from '../components/MutedList.svelte';
 
   /** Filter keys: the statuses, plus `review` = blocking + warnings. */
   type Filter = 'all' | 'fail' | 'review' | 'skip' | 'pass';
@@ -29,6 +33,17 @@
       error = null;
     }
   });
+
+  $effect(() => {
+    if (app.selectedGame) void mutes.load(app.selectedGame);
+  });
+
+  /** Mute key of a checklist item; a blocking one (`fail`) or a clear one is never muted. */
+  const keyOf = (f: PreflightFinding) => ({ rule: `preflight:${f.id}`, mode: null, blocking: f.severity === 'fail' || f.status === 'fail' || f.status === 'pass' });
+  const split = $derived(splitBy(report?.findings ?? [], mutes.game === app.selectedGame ? mutes.list : [], keyOf));
+  const muted = $derived(
+    mutedGroups(mutes.list, split.muted, (f) => ({ rule: `preflight:${f.id}`, modes: [null], title: f.label }), true, (m) => isPreflightKey(m.rule)),
+  );
 
   async function load(gameName: string, fresh = false) {
     const token = ++seq;
@@ -73,13 +88,15 @@
     pass: 'Clear',
   };
 
+  // Muted items (to review / not checkable only) leave every count.
+  const nOf = (st: PreflightFinding['status']) => split.shown.filter((f) => f.status === st).length;
   const counts = $derived({
-    all: report?.findings.length ?? 0,
+    all: split.shown.length,
     fail: report?.failCount ?? 0,
-    warn: report?.warnCount ?? 0,
-    review: (report?.failCount ?? 0) + (report?.warnCount ?? 0),
-    skip: report?.skipCount ?? 0,
-    pass: report?.findings.filter((f) => f.status === 'pass').length ?? 0,
+    warn: nOf('warn'),
+    review: (report?.failCount ?? 0) + nOf('warn'),
+    skip: nOf('skip'),
+    pass: nOf('pass'),
   });
 
   const FILTERS: { id: Filter; label: string }[] = [
@@ -91,7 +108,7 @@
   ];
 
   const shown = $derived(
-    (report?.findings ?? []).filter(
+    split.shown.filter(
       (f) =>
         filter === 'all' ||
         f.status === filter ||
@@ -207,6 +224,9 @@
                   {#if !f.explain && f.hits.length === 0}
                     <p class="explain">{f.detail}</p>
                   {/if}
+                  {#if !keyOf(f).blocking}
+                    <div class="fmute"><MuteButton rule={`preflight:${f.id}`} mode={null} /></div>
+                  {/if}
                 </div>
               {/if}
             </li>
@@ -215,6 +235,8 @@
       </section>
     {/if}
   {/each}
+
+  <MutedList groups={muted} count={split.muted.length} />
 
   <p class="disclaimer faint">
     A hit is not a verdict: the rules are literal, and a game that solves a
@@ -226,6 +248,12 @@
 {/if}
 
 <style>
+  .fmute {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 6px;
+  }
+
   .verdict-bar {
     display: flex;
     align-items: center;

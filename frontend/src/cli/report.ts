@@ -9,9 +9,10 @@
  * tab shows, down to the sentence.
  */
 import { allFindings, issuesOf, SEVERITIES, type Issue, type Severity } from '../lib/findings';
+import { splitIssues } from '../lib/muted';
 import { fx, pct, oneIn, type ModePopulations, type Population } from '../lib/populations';
 import { FIGURES, position, inMiddleRow, type GameMarket, type ModeMarket } from '../lib/market';
-import { fmtPct, type ModeStats, type GameCheckReport, type TiersReport, type GameVersion, type GameSummary, type SessionReach } from '../lib/api';
+import { fmtPct, type MuteEntry, type ModeStats, type GameCheckReport, type TiersReport, type GameVersion, type GameSummary, type SessionReach } from '../lib/api';
 
 // Node only (the frontend never imports this file): the few globals it uses, untyped here.
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exit(code?: number): never };
@@ -36,6 +37,8 @@ export interface GameData {
   pops: ModePopulations[];
   tiers: TiersReport | null;
   market: GameMarket | null;
+  /** Findings muted for this game in the UI (`/api/ui/games/{name}/muted`). */
+  muted?: MuteEntry[];
 }
 
 export const games = (base = DEFAULT_BASE) => get<GameSummary[]>(base, '/api/ui/games');
@@ -56,7 +59,7 @@ export async function waitImported(game: string, base = DEFAULT_BASE, timeoutMs 
 }
 
 export async function fetchGame(game: string, base = DEFAULT_BASE): Promise<GameData> {
-  const [list, v, s, checks, p, tiers, market] = await Promise.all([
+  const [list, v, s, checks, p, tiers, market, muted] = await Promise.all([
     games(base).catch(() => [] as GameSummary[]),
     version(game, base),
     get<{ modes: { mode: string; stats: ModeStats }[] }>(base, `/api/ui/games/${enc(game)}/stats`),
@@ -64,8 +67,9 @@ export async function fetchGame(game: string, base = DEFAULT_BASE): Promise<Game
     get<{ modes: ModePopulations[] }>(base, `/api/ui/games/${enc(game)}/populations`),
     get<TiersReport>(base, `/api/ui/games/${enc(game)}/tiers`).catch(() => null),
     get<GameMarket>(base, `/api/ui/games/${enc(game)}/market`).catch(() => null),
+    get<{ muted: MuteEntry[] }>(base, `/api/ui/games/${enc(game)}/muted`).then((r) => r.muted.map((m) => ({ ...m, mode: m.mode ?? null }))).catch(() => [] as MuteEntry[]),
   ]);
-  return { game, summary: list.find((g) => g.name === game), version: v, stats: s.modes, checks, pops: p.modes, tiers, market };
+  return { game, summary: list.find((g) => g.name === game), version: v, stats: s.modes, checks, pops: p.modes, tiers, market, muted };
 }
 
 /** Degen Lab ships past the 3★ grid with Stake's agreement — the folder says which studio. */
@@ -103,6 +107,8 @@ export interface Report {
   starTier: number;
   counts: Record<Severity, number>;
   issues: Issue[];
+  /** Muted in the UI for this game: out of `issues` and `counts`. */
+  muted: Issue[];
   modes: ModeReport[];
 }
 
@@ -110,7 +116,8 @@ const q = (p: Population, v: number) => p.quantiles.find((x) => Math.abs(x.q - v
 
 export function buildReport(d: GameData, lenient: boolean): Report {
   const tiers = d.tiers?.modes ?? [];
-  const issues = allFindings({ stats: d.stats, checks: d.checks, pops: d.pops, tiers, market: d.market, lenient });
+  const split = splitIssues(allFindings({ stats: d.stats, checks: d.checks, pops: d.pops, tiers, market: d.market, lenient }), d.muted ?? []);
+  const issues = split.shown;
   const counts = Object.fromEntries(SEVERITIES.map((s) => [s, issues.filter((i) => i.severity === s).length])) as Record<Severity, number>;
   const modes: ModeReport[] = d.stats.map(({ mode, stats: s }) => {
     const mp = d.pops.find((m) => m.mode === mode);
@@ -146,7 +153,7 @@ export function buildReport(d: GameData, lenient: boolean): Report {
       marketPeers: mm ? `${mm.count} ${mm.kind} peers, max win ${fx(mm.window[0])}–${fx(mm.window[1])}, cost ${mm.costs[0]}×–${mm.costs[1]}×` : null,
     };
   });
-  return { game: d.game, readAt: new Date().toISOString(), version: d.version, lenient, compliant: d.checks.passed, starTier: d.checks.starTier, counts, issues, modes };
+  return { game: d.game, readAt: new Date().toISOString(), version: d.version, lenient, compliant: d.checks.passed, starTier: d.checks.starTier, counts, issues, muted: split.muted, modes };
 }
 
 const n0 = (v: number) => (isFinite(v) ? Math.round(v).toLocaleString('en-US') : '—');
@@ -160,7 +167,7 @@ export function toMarkdown(r: Report, opts: { mode?: string; context?: boolean; 
   L.push(`Compliance: ${r.compliant ? 'COMPLIANT' : 'FAIL'} · estimated ${r.starTier}★ · 3★ grid ${r.lenient ? 'exceptions agreed for this studio (lenient)' : 'required (strict)'}`);
   L.push('');
   const faults = r.counts.blocking + r.counts.serious + r.counts.minor;
-  L.push(`## Worth a look — ${faults === 0 ? 'nothing: no blocking, serious or minor finding' : `${r.counts.blocking} blocking · ${r.counts.serious} serious · ${r.counts.minor} minor`}${opts.context ? ` · ${r.counts.context} context` : ` (${r.counts.context} context hidden)`}`);
+  L.push(`## Worth a look — ${faults === 0 ? 'nothing: no blocking, serious or minor finding' : `${r.counts.blocking} blocking · ${r.counts.serious} serious · ${r.counts.minor} minor`}${opts.context ? ` · ${r.counts.context} context` : ` (${r.counts.context} context hidden)`}${r.muted.length ? ` · ${r.muted.length} muted in the UI (${[...new Set(r.muted.map((i) => i.rule))].join(', ')})` : ''}`);
   const modesShown = [...r.modes.map((m) => m.mode), null].filter((m) => !opts.mode || m === opts.mode || m === null);
   for (const mode of modesShown) {
     const list = issuesOf(r.issues, mode).filter((i) => opts.context || i.severity !== 'context');
