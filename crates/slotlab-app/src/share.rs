@@ -13,10 +13,16 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// State of the current share (one at a time).
+/// State of the Share tab's share (one at a time), plus the shares pinned to
+/// their own port.
 #[derive(Default, Clone)]
 pub struct ShareManager {
     inner: Arc<Mutex<Option<ShareState>>>,
+    /// Shares started with their own `port` (≠ the Share tab's): each is
+    /// fronted by a stable hostname (`publicHost`, a named tunnel) and lives
+    /// beside the tab's share — starting or stopping one never touches the
+    /// other. Keyed by port.
+    pinned: Arc<Mutex<HashMap<u16, ShareState>>>,
 }
 
 struct ShareState {
@@ -24,8 +30,39 @@ struct ShareState {
     url: String,
     play_url: String,
     config: ShareConfig,
-    tunnel: tokio::process::Child,
+    port: u16,
+    build_dir: PathBuf,
+    /// Quick tunnel, when one was asked for (`tunnel: false` serves the
+    /// share through `publicHost` only).
+    tunnel: Option<tokio::process::Child>,
     server: tokio::task::JoinHandle<()>,
+}
+
+impl ShareState {
+    fn stop(mut self) {
+        if let Some(t) = self.tunnel.as_mut() {
+            let _ = t.start_kill();
+        }
+        self.server.abort();
+        tracing::info!("share stopped ({} on :{})", self.game, self.port);
+    }
+
+    fn status(&self) -> serde_json::Value {
+        json!({
+            "active": true,
+            "game": self.game,
+            "url": self.url,
+            "playUrl": self.play_url,
+            "port": self.port,
+            "buildDir": self.build_dir,
+            "tunnel": self.tunnel.is_some(),
+            "publicHost": self.config.public_host,
+            "balance": self.config.balance_micro,
+            "currency": self.config.currency,
+            "language": self.config.language,
+            "social": self.config.social,
+        })
+    }
 }
 
 /// Settings handed to every visitor of the public link.
@@ -93,6 +130,62 @@ struct StartReq {
     language: Option<String>,
     #[serde(default)]
     social: Option<bool>,
+    /// Stable hostname fronting the share server (a named tunnel such as
+    /// `mg-rush.mcberry.fr`, or a reverse proxy). Put in every visitor's
+    /// `rgs_url` instead of the quick tunnel's host.
+    #[serde(default)]
+    public_host: Option<String>,
+    /// `false` → no quick tunnel: the server is only reached through
+    /// `publicHost` (required then). Default: a tunnel, except for a pinned
+    /// share.
+    #[serde(default)]
+    tunnel: Option<bool>,
+    /// Local port of the share server. Absent (or the Share tab's port) →
+    /// the tab's share, which replaces the previous one. Any other port → a
+    /// PINNED share living beside it (requires `publicHost`): a stable public
+    /// name must never serve whatever the tab happens to share.
+    #[serde(default)]
+    port: Option<u16>,
+    /// Demo console injected in the page (force a result). Default: on.
+    #[serde(default)]
+    console: Option<bool>,
+}
+
+/// `mg-rush.mcberry.fr` from `https://mg-rush.mcberry.fr/`, None when empty.
+/// Refuses anything that is not a bare host (it lands in a URL).
+fn normalize_host(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let host = raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    anyhow::ensure!(
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')),
+        "publicHost must be a bare hostname (got {raw:?})"
+    );
+    Ok(Some(host.to_ascii_lowercase()))
+}
+
+/// The share's RGS answers for the shared game only: a visitor must not be
+/// able to play another registered game by hitting its RGS path directly
+/// (same rule as the hub's `resolve_mw`).
+async fn only_shared_game(
+    Extension(cfg): Extension<ShareConfig>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(rest) = req.uri().path().strip_prefix("/api/rgs/") {
+        let asked = rest.split('/').next().unwrap_or("");
+        if !asked.eq_ignore_ascii_case(&cfg.game) {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    next.run(req).await
 }
 
 fn find_cloudflared() -> Option<PathBuf> {
@@ -128,8 +221,25 @@ async fn start(
 }
 
 async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value> {
-    // One share at a time: stop the existing one.
-    stop_current(state);
+    let port = req.port.unwrap_or_else(share_port);
+    // Pinned share: its own port, beside the Share tab's one.
+    let pinned = port != share_port();
+    let public_host = normalize_host(req.public_host.as_deref())?;
+    let want_tunnel = req.tunnel.unwrap_or(!pinned);
+    anyhow::ensure!(
+        !pinned || public_host.is_some(),
+        "a share on its own port (:{port}) needs publicHost — the stable name that fronts it"
+    );
+    anyhow::ensure!(
+        want_tunnel || public_host.is_some(),
+        "tunnel: false needs publicHost — without a quick tunnel nothing else reaches the share"
+    );
+    // One share per port: stop the one this start replaces.
+    if pinned {
+        stop_pinned(state, port);
+    } else {
+        stop_current(state);
+    }
 
     let game = state
         .registry
@@ -155,8 +265,14 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
          (pnpm --filter <game> build)",
         build_dir.display()
     );
-    let cloudflared = find_cloudflared()
-        .context("cloudflared not found — install it: brew install cloudflared")?;
+    let cloudflared = if want_tunnel {
+        Some(
+            find_cloudflared()
+                .context("cloudflared not found — install it: brew install cloudflared")?,
+        )
+    } else {
+        None
+    };
 
     let config = ShareConfig {
         game: req.game.clone(),
@@ -164,7 +280,7 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
         currency: req.currency.unwrap_or_else(|| "USD".into()),
         language: req.language.unwrap_or_else(|| "en".into()),
         social: req.social.unwrap_or(false),
-        public_host: None,
+        public_host: public_host.clone(),
     };
 
     // Server :3602 — game statics + RGS contract (HTTP, the tunnel
@@ -183,18 +299,21 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
             language: config.language.clone(),
             social: config.social,
             access_code: String::new(),
-            console: true,
+            console: req.console.unwrap_or(true),
             published_at: String::new(),
         },
-        build_dir,
+        build_dir: build_dir.clone(),
         gate: Arc::new(crate::gate::Gate::open()),
         config: config.clone(),
     });
+    // ⚠️ Layer order: the extensions are added OUTSIDE `only_shared_game`,
+    // which reads the config.
     let share_app = Router::new()
         .route("/play", get(landing))
         .merge(crate::rgs::routes::router())
         .merge(crate::console::router())
         .fallback(crate::hub::serve_static)
+        .layer(axum::middleware::from_fn(only_shared_game))
         .layer(Extension(game_entry))
         .layer(Extension(config.clone()))
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -202,7 +321,6 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
     let share_app: Router = Router::new()
         .fallback_service(share_app)
         .layer(axum::middleware::from_fn(crate::gate::strip_key));
-    let port = share_port();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -213,8 +331,64 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
         }
     });
 
-    // Cloudflared quick tunnel (free, no account).
-    let mut child = tokio::process::Command::new(&cloudflared)
+    let (tunnel, url) = match cloudflared {
+        Some(cloudflared) => {
+            let (child, url) = match quick_tunnel(&cloudflared, port).await {
+                Ok(t) => t,
+                Err(e) => {
+                    server.abort();
+                    return Err(e);
+                }
+            };
+            (Some(child), url)
+        }
+        // No quick tunnel: the stable name is the public address.
+        None => (
+            None,
+            format!("https://{}", public_host.as_deref().unwrap_or_default()),
+        ),
+    };
+
+    // The shared link points at /play, NOT at a baked sessionID: every
+    // opening gets its own session (own balance, own active round).
+    let play_url = format!("{url}/play");
+
+    let share = ShareState {
+        game: req.game.clone(),
+        url: url.clone(),
+        play_url: play_url.clone(),
+        config,
+        port,
+        build_dir,
+        tunnel,
+        server,
+    };
+    if pinned {
+        state.share.pinned.lock().unwrap().insert(port, share);
+    } else {
+        *state.share.inner.lock().unwrap() = Some(share);
+    }
+    tracing::info!(
+        "share active: {play_url} (:{port}{})",
+        if pinned { ", pinned" } else { "" }
+    );
+    Ok(json!({
+        "ok": true,
+        "url": url,
+        "playUrl": play_url,
+        "game": req.game,
+        "port": port,
+        "pinned": pinned,
+    }))
+}
+
+/// Cloudflared quick tunnel (free, no account) to the share port. Returns
+/// the child and its `https://*.trycloudflare.com` URL.
+async fn quick_tunnel(
+    cloudflared: &std::path::Path,
+    port: u16,
+) -> Result<(tokio::process::Child, String)> {
+    let mut child = tokio::process::Command::new(cloudflared)
         .args([
             "tunnel",
             "--url",
@@ -256,22 +430,7 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
     .context("cloudflared did not return a trycloudflare.com URL within 30 s")?;
     // Keep draining stderr in the background.
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-
-    // The shared link points at /play, NOT at a baked sessionID: every
-    // opening gets its own session (own balance, own active round).
-    let play_url = format!("{url}/play");
-
-    let mut inner = state.share.inner.lock().unwrap();
-    *inner = Some(ShareState {
-        game: req.game.clone(),
-        url: url.clone(),
-        play_url: play_url.clone(),
-        config,
-        tunnel: child,
-        server,
-    });
-    tracing::info!("share active: {play_url}");
-    Ok(json!({ "ok": true, "url": url, "playUrl": play_url, "game": req.game }))
+    Ok((child, url))
 }
 
 /// GET /play — hands the visitor their session, then redirects into the
@@ -428,34 +587,55 @@ fn browser_of(ua: &str) -> &'static str {
 }
 
 fn stop_current(state: &AppState) {
-    let mut inner = state.share.inner.lock().unwrap();
-    if let Some(mut s) = inner.take() {
-        let _ = s.tunnel.start_kill();
-        s.server.abort();
-        tracing::info!("share stopped ({})", s.game);
+    let taken = state.share.inner.lock().unwrap().take();
+    if let Some(s) = taken {
+        s.stop();
     }
 }
 
-async fn stop(State(state): State<AppState>) -> Json<serde_json::Value> {
-    stop_current(&state);
-    Json(json!({ "ok": true }))
+fn stop_pinned(state: &AppState, port: u16) -> bool {
+    let taken = state.share.pinned.lock().unwrap().remove(&port);
+    taken.map(ShareState::stop).is_some()
 }
 
+#[derive(Deserialize, Default)]
+struct StopReq {
+    /// Pinned share to stop. Absent → the Share tab's share.
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+/// POST /api/ui/share/stop — the Share tab's share, or `{"port": N}` for a
+/// pinned one. The body is optional (the tab sends none).
+async fn stop(State(state): State<AppState>, body: axum::body::Bytes) -> Json<serde_json::Value> {
+    let req: StopReq = serde_json::from_slice(&body).unwrap_or_default();
+    match req.port.filter(|p| *p != share_port()) {
+        Some(port) => Json(json!({ "ok": stop_pinned(&state, port), "port": port })),
+        None => {
+            stop_current(&state);
+            Json(json!({ "ok": true }))
+        }
+    }
+}
+
+/// GET /api/ui/share/status — the Share tab's share (same fields as
+/// before), plus `pinned`: the shares living on their own port.
 async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let inner = state.share.inner.lock().unwrap();
-    match &*inner {
-        Some(s) => Json(json!({
-            "active": true,
-            "game": s.game,
-            "url": s.url,
-            "playUrl": s.play_url,
-            "balance": s.config.balance_micro,
-            "currency": s.config.currency,
-            "language": s.config.language,
-            "social": s.config.social,
-        })),
-        None => Json(json!({ "active": false })),
-    }
+    let mut out = match &*state.share.inner.lock().unwrap() {
+        Some(s) => s.status(),
+        None => json!({ "active": false }),
+    };
+    let mut pinned: Vec<_> = state
+        .share
+        .pinned
+        .lock()
+        .unwrap()
+        .values()
+        .map(ShareState::status)
+        .collect();
+    pinned.sort_by_key(|v| v["port"].as_u64());
+    out["pinned"] = json!(pinned);
+    Json(out)
 }
 
 /// GET /api/ui/share/sessions — who is playing behind the public link.
@@ -502,4 +682,25 @@ async fn reset_session(
         .unwrap_or(DEFAULT_SHARE_BALANCE);
     let ok = state.sessions.reset_one(&req.session_id, balance);
     Json(json!({ "ok": ok }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_host;
+
+    #[test]
+    fn public_host_is_a_bare_host() {
+        let host = |raw: Option<&str>| normalize_host(raw).unwrap();
+        assert_eq!(
+            host(Some(" https://MG-Rush.mcberry.fr/ ")).as_deref(),
+            Some("mg-rush.mcberry.fr")
+        );
+        assert_eq!(host(Some("127.0.0.1:3603")).as_deref(), Some("127.0.0.1:3603"));
+        assert_eq!(host(Some("  ")), None);
+        assert_eq!(host(None), None);
+        // it lands in the visitor's URL: nothing but a host
+        assert!(normalize_host(Some("evil.com/x?y")).is_err());
+        assert!(normalize_host(Some("a b.com")).is_err());
+        assert!(normalize_host(Some("https://")).is_err());
+    }
 }

@@ -196,6 +196,15 @@ exposed via cloudflared).
 - **Share** — the game's static build + emulated RGS behind a Cloudflare
   quick tunnel (`*.trycloudflare.com`): a playable link to send to a friend,
   with nothing to install on their end. Prerequisite: `brew install cloudflared`.
+  **Pinned shares** (API only) live beside the tab's one, each on its own
+  port behind a stable name (named tunnel, reverse proxy):
+  `POST /api/ui/share/start {"game", "buildDir", "balance", "port": 3603,
+  "publicHost": "x.example.com", "tunnel": false, "console": false}` — the
+  visitor's `rgs_url` uses `publicHost`; `tunnel: false` skips the quick
+  tunnel. `GET /api/ui/share/status` lists them under `pinned`;
+  `POST /api/ui/share/stop {"port": 3603}` stops one. A share's RGS answers
+  for the shared game only (404 otherwise). Shares die with SlotLab: restart
+  a pinned one from a watchdog (e.g. a systemd user unit polling `status`).
 
 ## Architecture
 
