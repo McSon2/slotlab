@@ -188,6 +188,52 @@ async fn only_shared_game(
     next.run(req).await
 }
 
+/// GET `/` (or `/index.html`) WITHOUT a session — the bare address, typed or
+/// forwarded without `/play`: the game would stop on MISSING_RGS_URL. Send
+/// the visitor through `/play`, which mints the session and the `rgs_url`.
+async fn root_to_play(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let read = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if let Some(target) = read.then(|| play_redirect(req.uri())).flatten() {
+        return (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Redirect::to(&target),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// Where `/` without a session goes: `/play`, keeping what `/play` reads
+/// (`lang`, `device`, `currency`) when it is a plain token — anything else is
+/// dropped (it would land in a Location header). None → serve the page.
+fn play_redirect(uri: &axum::http::Uri) -> Option<String> {
+    if !matches!(uri.path(), "/" | "/index.html") {
+        return None;
+    }
+    let Query(pairs) = Query::<Vec<(String, String)>>::try_from_uri(uri).unwrap_or(Query(vec![]));
+    let value = |key: &str| {
+        pairs
+            .iter()
+            .find(|(k, v)| k == key && !v.is_empty())
+            .map(|(_, v)| v.as_str())
+    };
+    if value("sessionID").is_some() {
+        return None;
+    }
+    let plain = |v: &&str| {
+        v.len() <= 16 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    let kept: Vec<String> = ["lang", "device", "currency"]
+        .into_iter()
+        .filter_map(|k| value(k).filter(plain).map(|v| format!("{k}={v}")))
+        .collect();
+    Some(if kept.is_empty() {
+        "/play".into()
+    } else {
+        format!("/play?{}", kept.join("&"))
+    })
+}
+
 fn find_cloudflared() -> Option<PathBuf> {
     for p in [
         "/opt/homebrew/bin/cloudflared",
@@ -313,6 +359,7 @@ async fn start_impl(state: &AppState, req: StartReq) -> Result<serde_json::Value
         .merge(crate::rgs::routes::router())
         .merge(crate::console::router())
         .fallback(crate::hub::serve_static)
+        .layer(axum::middleware::from_fn(root_to_play))
         .layer(axum::middleware::from_fn(only_shared_game))
         .layer(Extension(game_entry))
         .layer(Extension(config.clone()))
@@ -686,7 +733,27 @@ async fn reset_session(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_host;
+    use super::{normalize_host, play_redirect};
+
+    #[test]
+    fn bare_address_goes_through_play() {
+        let to = |uri: &str| play_redirect(&uri.parse().unwrap());
+        assert_eq!(to("/").as_deref(), Some("/play"));
+        assert_eq!(to("/index.html").as_deref(), Some("/play"));
+        assert_eq!(to("/?sessionID=").as_deref(), Some("/play"));
+        // what /play reads is kept, in a fixed order; the rest is dropped
+        assert_eq!(
+            to("/?device=mobile&foo=bar&lang=fr&currency=EUR").as_deref(),
+            Some("/play?lang=fr&device=mobile&currency=EUR")
+        );
+        // never anything that is not a plain token (it lands in a Location header)
+        assert_eq!(to("/?lang=%0d%0aSet-Cookie:x&device=mobile").as_deref(), Some("/play?device=mobile"));
+        // a session, or anything but the page itself: served as is
+        assert_eq!(to("/?sessionID=share-1&rgs_url=x/api/rgs/g"), None);
+        assert_eq!(to("/play"), None);
+        assert_eq!(to("/assets/x.png"), None);
+        assert_eq!(to("/api/rgs/g/wallet/balance"), None);
+    }
 
     #[test]
     fn public_host_is_a_bare_host() {
