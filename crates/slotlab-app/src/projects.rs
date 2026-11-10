@@ -201,6 +201,10 @@ fn norm(p: &Path) -> PathBuf {
 
 /// SlotLab game reading this publish_files directory (or one under it).
 fn match_game(publish_files: &str, games: &[(String, PathBuf, PathBuf)]) -> Option<String> {
+    if publish_files.is_empty() {
+        // Drive-only project: no folder on the VPS, `""` would prefix every path.
+        return None;
+    }
     let raw = Path::new(publish_files);
     let canon = norm(raw);
     games

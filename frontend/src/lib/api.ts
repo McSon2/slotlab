@@ -900,8 +900,10 @@ export interface Project {
   /** Unix seconds. */
   last_modified: number;
   archived: { remote: string; archived_at: string | number; bytes: number } | null;
-  /** false = whole game archived on Drive, folder gone from the VPS. */
+  /** false = the game folder is no longer on the VPS (only its Drive copy remains). */
   on_vps: boolean;
+  /** A copy of the library exists on Google Drive. */
+  on_drive: boolean;
   /** Size of the whole game folder on the VPS. */
   bytes_game: number;
   status: ProjectStatus;

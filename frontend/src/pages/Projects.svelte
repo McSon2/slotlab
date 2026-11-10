@@ -17,7 +17,7 @@
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import Icon from '../components/Icon.svelte';
 
-  type Filter = 'all' | ProjectStatus;
+  type Filter = 'all' | 'drive' | ProjectStatus;
 
   let data = $state<ProjectList | null>(null);
   let loadError = $state<string | null>(null);
@@ -139,7 +139,7 @@
 
   function where(p: Project): { label: string; cls: string; title: string } {
     if (!p.on_vps)
-      return { label: 'Drive', cls: 'blue', title: `Whole game archived on ${p.archived?.remote ?? 'Drive'}` };
+      return { label: 'Drive only', cls: 'blue', title: `Not on the VPS any more — ${p.archived?.remote ?? 'Drive'}` };
     if (p.has_publish && p.archived)
       return { label: 'VPS + Drive', cls: 'green', title: `On the VPS, copy on ${p.archived.remote}` };
     if (p.has_publish) return { label: 'VPS', cls: 'green', title: p.publish_files };
@@ -152,9 +152,10 @@
   }
 
   const counts = $derived.by(() => {
-    const c: Record<Filter, number> = { all: 0, en_cours: 0, pause: 0, livre: 0 };
+    const c: Record<Filter, number> = { all: 0, drive: 0, en_cours: 0, pause: 0, livre: 0 };
     for (const p of data?.projects ?? []) {
       c.all++;
+      if (p.on_drive) c.drive++;
       c[p.status]++;
     }
     return c;
@@ -164,7 +165,7 @@
     const q = query.trim().toLowerCase();
     const list = (data?.projects ?? []).filter(
       (p) =>
-        (filter === 'all' || p.status === filter) &&
+        (filter === 'all' || (filter === 'drive' ? p.on_drive : p.status === filter)) &&
         (!q ||
           [p.game, p.client, p.math_id, p.slotlab_game ?? ''].some((s) =>
             s.toLowerCase().includes(q),
@@ -199,6 +200,7 @@
     { id: 'en_cours', label: 'In progress' },
     { id: 'pause', label: 'Paused' },
     { id: 'livre', label: 'Delivered' },
+    { id: 'drive', label: 'On Drive' },
   ];
 </script>
 
@@ -232,8 +234,9 @@
     </div>
     <p class="legend faint">
       <b>Clean</b> deletes regenerable intermediates ({fmtBytes(reclaimable)} in total), keeps
-      publish_files. <b>Archive</b> moves the whole game (math, front, code) to
-      {data?.remote ?? 'Google Drive'} and removes it from the VPS; <b>Restore</b> brings it back.
+      publish_files. <b>Archive</b> (finished slot) copies the library to
+      {data?.remote ?? 'Google Drive'}, then deletes publish_files from the VPS — code and configs stay, so
+      it can be re-simulated; <b>Restore</b> brings publish_files back.
     </p>
   {:else if loadError}
     <p class="field-error" role="alert">{loadError}</p>
@@ -347,25 +350,25 @@
                   Clean
                 </ConfirmButton>
               {/if}
-              {#if p.on_vps}
+              {#if p.on_vps && !p.archived && (p.has_publish || p.bytes_intermediate > 0)}
                 <ConfirmButton
                   onconfirm={() => act(p, 'archive')}
                   variant="plain"
                   disabled={isBusy}
-                  confirmLabel="Move the whole game ({fmtBytes(p.bytes_game)}) to Drive?"
-                  title="Clean, upload the whole game to Google Drive, verify, then remove it from the VPS (git code stays in the repo)"
+                  confirmLabel="Finished? Move {fmtBytes(p.bytes_publish)} to Drive?"
+                  title="Finished slot: clean, copy the library to Google Drive, verify, then delete publish_files from the VPS (code and configs stay)"
                   ariaLabel="Archive {p.game} to Drive"
                 >
                   Archive to Drive
                 </ConfirmButton>
               {/if}
-              {#if p.archived && (!p.on_vps || !p.has_publish)}
+              {#if (p.archived && !p.has_publish) || (!p.on_vps && p.on_drive)}
                 <ConfirmButton
                   onconfirm={() => act(p, 'restore')}
                   variant="plain"
                   disabled={isBusy}
-                  confirmLabel="Download {fmtBytes(p.archived.bytes)}?"
-                  title="Bring the game back on the VPS from Google Drive"
+                  confirmLabel="Download {p.archived?.bytes ? fmtBytes(p.archived.bytes) : 'from Drive'}?"
+                  title="Bring publish_files back on the VPS from Google Drive"
                   ariaLabel="Restore {p.game}"
                 >
                   Restore
