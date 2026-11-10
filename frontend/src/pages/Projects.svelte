@@ -138,6 +138,8 @@
   }
 
   function where(p: Project): { label: string; cls: string; title: string } {
+    if (!p.on_vps)
+      return { label: 'Drive', cls: 'blue', title: `Whole game archived on ${p.archived?.remote ?? 'Drive'}` };
     if (p.has_publish && p.archived)
       return { label: 'VPS + Drive', cls: 'green', title: `On the VPS, copy on ${p.archived.remote}` };
     if (p.has_publish) return { label: 'VPS', cls: 'green', title: p.publish_files };
@@ -230,8 +232,8 @@
     </div>
     <p class="legend faint">
       <b>Clean</b> deletes regenerable intermediates ({fmtBytes(reclaimable)} in total), keeps
-      publish_files. <b>Archive</b> moves the whole library to {data?.remote ?? 'Google Drive'};
-      <b>Restore</b> brings publish_files back.
+      publish_files. <b>Archive</b> moves the whole game (math, front, code) to
+      {data?.remote ?? 'Google Drive'} and removes it from the VPS; <b>Restore</b> brings it back.
     </p>
   {:else if loadError}
     <p class="field-error" role="alert">{loadError}</p>
@@ -333,7 +335,7 @@
                   <Icon name="link" size={12} /> Share
                 </button>
               {/if}
-              {#if p.bytes_intermediate > 0}
+              {#if p.on_vps && p.bytes_intermediate > 0}
                 <ConfirmButton
                   onconfirm={() => act(p, 'clean')}
                   variant="plain"
@@ -345,25 +347,25 @@
                   Clean
                 </ConfirmButton>
               {/if}
-              {#if p.has_publish}
+              {#if p.on_vps}
                 <ConfirmButton
                   onconfirm={() => act(p, 'archive')}
                   variant="plain"
                   disabled={isBusy}
-                  confirmLabel="Move {fmtBytes(p.bytes_publish)} to Drive?"
-                  title="Clean, upload the library to Google Drive, verify, then free the VPS"
+                  confirmLabel="Move the whole game ({fmtBytes(p.bytes_game)}) to Drive?"
+                  title="Clean, upload the whole game to Google Drive, verify, then remove it from the VPS (git code stays in the repo)"
                   ariaLabel="Archive {p.game} to Drive"
                 >
                   Archive to Drive
                 </ConfirmButton>
               {/if}
-              {#if p.archived && !p.has_publish}
+              {#if p.archived && (!p.on_vps || !p.has_publish)}
                 <ConfirmButton
                   onconfirm={() => act(p, 'restore')}
                   variant="plain"
                   disabled={isBusy}
                   confirmLabel="Download {fmtBytes(p.archived.bytes)}?"
-                  title="Download publish_files back from Google Drive"
+                  title="Bring the game back on the VPS from Google Drive"
                   ariaLabel="Restore {p.game}"
                 >
                   Restore

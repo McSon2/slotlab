@@ -900,6 +900,10 @@ export interface Project {
   /** Unix seconds. */
   last_modified: number;
   archived: { remote: string; archived_at: string | number; bytes: number } | null;
+  /** false = whole game archived on Drive, folder gone from the VPS. */
+  on_vps: boolean;
+  /** Size of the whole game folder on the VPS. */
+  bytes_game: number;
   status: ProjectStatus;
   running: boolean;
   slotlab_game: string | null;
