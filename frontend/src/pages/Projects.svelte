@@ -350,12 +350,12 @@
                   Clean
                 </ConfirmButton>
               {/if}
-              {#if p.on_vps && !p.archived && (p.has_publish || p.bytes_intermediate > 0)}
+              {#if p.on_vps && !p.archived}
                 <ConfirmButton
                   onconfirm={() => act(p, 'archive')}
                   variant="plain"
                   disabled={isBusy}
-                  confirmLabel="Finished? Move {fmtBytes(p.bytes_publish)} to Drive?"
+                  confirmLabel={p.has_publish ? `Finished? Move ${fmtBytes(p.bytes_publish)} to Drive?` : "Finished? Archive to Drive?"}
                   title="Finished slot: clean, copy the library to Google Drive, verify, then delete publish_files from the VPS (code and configs stay)"
                   ariaLabel="Archive {p.game} to Drive"
                 >
