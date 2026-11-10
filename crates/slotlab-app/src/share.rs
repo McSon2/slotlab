@@ -220,6 +220,11 @@ fn play_redirect(uri: &axum::http::Uri) -> Option<String> {
     if value("sessionID").is_some() {
         return None;
     }
+    // a replay deep link needs no session: the game reads the book from
+    // `/bet/replay/…` (rgs_url in the query) — served as is
+    if value("replay") == Some("true") {
+        return None;
+    }
     let plain = |v: &&str| {
         v.len() <= 16 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     };
@@ -753,6 +758,20 @@ mod tests {
         assert_eq!(to("/play"), None);
         assert_eq!(to("/assets/x.png"), None);
         assert_eq!(to("/api/rgs/g/wallet/balance"), None);
+    }
+
+    #[test]
+    fn replay_link_is_served_without_session() {
+        let to = |uri: &str| play_redirect(&uri.parse().unwrap());
+        assert_eq!(
+            to("/?replay=true&game=meatgrinder&version=0&mode=BASE&event=42&amount=1000000\
+                &rgs_url=mg-rush.mcberry.fr/api/rgs/meatgrinder&lang=en&currency=USD"),
+            None
+        );
+        assert_eq!(to("/index.html?replay=true&event=42"), None);
+        // anything but `replay=true` still goes through /play
+        assert_eq!(to("/?replay=false&event=42").as_deref(), Some("/play"));
+        assert_eq!(to("/?replay=").as_deref(), Some("/play"));
     }
 
     #[test]
