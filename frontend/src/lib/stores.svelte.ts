@@ -4,6 +4,7 @@ import { storageGet, storageRemove, storageSet } from './storage';
 
 export type Tab =
   | 'projects'
+  | 'drive'
   | 'games'
   | 'play'
   | 'board'
@@ -22,6 +23,7 @@ export type PublishView = 'link' | 'homelab';
 
 const TABS: Tab[] = [
   'projects',
+  'drive',
   'games',
   'play',
   'board',

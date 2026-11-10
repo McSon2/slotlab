@@ -21,6 +21,7 @@
   type PageModule = Promise<{ default: Component }>;
   const pageLoaders: Partial<Record<Tab, () => PageModule>> = {
     projects: () => import('./pages/Projects.svelte'),
+    drive: () => import('./pages/Drive.svelte'),
     analyze: () => import('./pages/Analyze.svelte'),
     balance: () => import('./pages/Balance.svelte'),
     challenge: () => import('./pages/Challenge.svelte'),
@@ -58,6 +59,7 @@
       label: 'Setup',
       tabs: [
         { id: 'projects', label: 'Projects', icon: 'projects' },
+        { id: 'drive', label: 'Drive', icon: 'drive' },
         { id: 'games', label: 'Games', icon: 'games' },
       ],
     },
@@ -92,6 +94,7 @@
   /** One line under each page title: what the page answers. */
   const pageIntro: Record<Tab, string> = {
     projects: 'Every slot project on the VPS: where its math lives, what it weighs, and what to archive.',
+    drive: 'Finished slots stored on Google Drive, ready to come back to the VPS.',
     games: 'The games SlotLab knows: where their books are, and what each mode pays.',
     play: 'Play the build against the emulated RGS, in every screen size at once.',
     board: 'The board the game shows before the first spin: edit it, check it, write it back.',

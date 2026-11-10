@@ -17,7 +17,7 @@
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import Icon from '../components/Icon.svelte';
 
-  type Filter = 'all' | 'drive' | ProjectStatus;
+  type Filter = 'all' | ProjectStatus;
 
   let data = $state<ProjectList | null>(null);
   let loadError = $state<string | null>(null);
@@ -147,15 +147,21 @@
     return { label: 'No math yet', cls: '', title: 'No publish_files on the VPS, nothing archived' };
   }
 
+  /** Finished and archived: it lives in the Drive tab, not among the work in progress. */
+  function archivedOnly(p: Project): boolean {
+    return !p.on_vps || (!!p.archived && !p.has_publish);
+  }
+  const archivedCount = $derived((data?.projects ?? []).filter(archivedOnly).length);
+
   function busy(p: Project): boolean {
     return p.running || pending[p.key] || jobs[p.key]?.state === 'running';
   }
 
   const counts = $derived.by(() => {
-    const c: Record<Filter, number> = { all: 0, drive: 0, en_cours: 0, pause: 0, livre: 0 };
+    const c: Record<Filter, number> = { all: 0, en_cours: 0, pause: 0, livre: 0 };
     for (const p of data?.projects ?? []) {
+      if (archivedOnly(p)) continue;
       c.all++;
-      if (p.on_drive) c.drive++;
       c[p.status]++;
     }
     return c;
@@ -165,7 +171,8 @@
     const q = query.trim().toLowerCase();
     const list = (data?.projects ?? []).filter(
       (p) =>
-        (filter === 'all' || (filter === 'drive' ? p.on_drive : p.status === filter)) &&
+        !archivedOnly(p) &&
+        (filter === 'all' || p.status === filter) &&
         (!q ||
           [p.game, p.client, p.math_id, p.slotlab_game ?? ''].some((s) =>
             s.toLowerCase().includes(q),
@@ -200,7 +207,6 @@
     { id: 'en_cours', label: 'In progress' },
     { id: 'pause', label: 'Paused' },
     { id: 'livre', label: 'Delivered' },
-    { id: 'drive', label: 'On Drive' },
   ];
 </script>
 
@@ -259,6 +265,12 @@
 
   {#if loadError}
     <p class="field-error" role="alert">{loadError}</p>
+  {/if}
+  {#if archivedCount > 0}
+    <p class="faint archived-note">
+      {archivedCount} archived game{archivedCount > 1 ? 's' : ''} hidden —
+      <button class="linklike" onclick={() => goTo('drive')}>see the Drive tab</button>
+    </p>
   {/if}
 
   {#each groups as g (g.client)}
@@ -497,6 +509,21 @@
 
   .client {
     margin-bottom: var(--sp-6);
+  }
+
+  .archived-note {
+    margin: 0 0 var(--sp-4);
+    font-size: var(--fs-xs);
+  }
+
+  .linklike {
+    border: none;
+    background: none;
+    padding: 0;
+    color: var(--gold);
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
   }
 
   .grid {

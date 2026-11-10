@@ -30,6 +30,43 @@ pub fn router() -> Router<AppState> {
         .route("/api/ui/projects", get(list))
         .route("/api/ui/projects/jobs", get(jobs))
         .route("/api/ui/projects/action", post(action))
+        .route("/api/ui/projects/drive", get(drive))
+}
+
+/// Reading the whole Drive archive takes ~20 s: one answer serves the Drive tab for a while.
+const DRIVE_TTL: Duration = Duration::from_secs(120);
+
+fn drive_cache() -> &'static tokio::sync::Mutex<Option<(Instant, Value)>> {
+    static C: OnceLock<tokio::sync::Mutex<Option<(Instant, Value)>>> = OnceLock::new();
+    C.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// GET /api/ui/projects/drive — `slot drive --json`: every game stored on Google Drive.
+async fn drive(Query(q): Query<ListQuery>) -> Response {
+    let force = q.refresh.is_some_and(|r| r != "0" && r != "false");
+    let mut cache = drive_cache().lock().await;
+    if !force {
+        if let Some((at, v)) = cache.as_ref() {
+            if at.elapsed() < DRIVE_TTL {
+                return Json(v.clone()).into_response();
+            }
+        }
+    }
+    let out = match Command::new(slot_bin()).args(["drive", "--json"]).stdin(Stdio::null()).output().await {
+        Ok(o) => o,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot run `slot`: {e}")),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return err(StatusCode::BAD_GATEWAY, format!("`slot drive` failed: {}", stderr.trim()));
+    }
+    match serde_json::from_slice::<Value>(&out.stdout) {
+        Ok(v) => {
+            *cache = Some((Instant::now(), v.clone()));
+            Json(v).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("`slot drive` returned invalid JSON: {e}")),
+    }
 }
 
 /// `slot list` takes about a second: one answer serves every poll for a while.
@@ -193,6 +230,7 @@ async fn slot_list(force: bool) -> Result<Value, String> {
 
 async fn invalidate() {
     *manager().cache.lock().await = None;
+    *drive_cache().lock().await = None;
 }
 
 fn norm(p: &Path) -> PathBuf {

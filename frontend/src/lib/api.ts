@@ -864,6 +864,8 @@ export const api = {
   /** Every slot project on the VPS — `slot list --json` + SlotLab game + job. */
   projects: (refresh = false) =>
     request<ProjectList>(`/api/ui/projects${refresh ? '?refresh=1' : ''}`),
+  /** Every game stored on Google Drive — `slot drive --json` (~20 s, cached 2 min). */
+  drive: (refresh = false) => request<DriveList>(`/api/ui/projects/drive${refresh ? '?refresh=1' : ''}`),
   projectJobs: () => request<{ jobs: ProjectJob[] }>('/api/ui/projects/jobs'),
   projectAction: (key: string, action: ProjectAction, status?: ProjectStatus) =>
     request<{ job: ProjectJob | null }>('/api/ui/projects/action', {
@@ -873,6 +875,28 @@ export const api = {
 };
 
 export type ProjectStatus = 'en_cours' | 'pause' | 'livre';
+
+export interface DriveGame {
+  key: string;
+  client: string;
+  game: string;
+  remote: string;
+  bytes: number;
+  files: number;
+  publish_bytes: number;
+  /** RFC 3339, newest file on Drive. */
+  modified: string;
+  /** Unix seconds, from the archive marker on the VPS. */
+  archived_at: number | null;
+  on_vps: boolean;
+  has_publish_vps: boolean;
+  status: ProjectStatus;
+}
+
+export interface DriveList {
+  remote: string;
+  games: DriveGame[];
+}
 export type ProjectAction = 'archive' | 'restore' | 'clean' | 'status';
 
 export interface ProjectJob {
