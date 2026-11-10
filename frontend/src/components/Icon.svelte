@@ -1,5 +1,6 @@
 <script lang="ts" module>
   export type IconName =
+    | 'projects'
     | 'games'
     | 'play'
     | 'board'
@@ -44,7 +45,10 @@
   aria-hidden="true"
   focusable="false"
 >
-  {#if name === 'games'}
+  {#if name === 'projects'}
+    <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    <path d="M2 10h20" />
+  {:else if name === 'games'}
     <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
   {:else if name === 'play'}
     <polygon points="6 3 20 12 6 21 6 3" />

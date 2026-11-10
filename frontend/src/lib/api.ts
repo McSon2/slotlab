@@ -861,7 +861,56 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path }),
     }),
+  /** Every slot project on the VPS — `slot list --json` + SlotLab game + job. */
+  projects: (refresh = false) =>
+    request<ProjectList>(`/api/ui/projects${refresh ? '?refresh=1' : ''}`),
+  projectJobs: () => request<{ jobs: ProjectJob[] }>('/api/ui/projects/jobs'),
+  projectAction: (key: string, action: ProjectAction, status?: ProjectStatus) =>
+    request<{ job: ProjectJob | null }>('/api/ui/projects/action', {
+      method: 'POST',
+      body: JSON.stringify({ key, action, status }),
+    }),
 };
+
+export type ProjectStatus = 'en_cours' | 'pause' | 'livre';
+export type ProjectAction = 'archive' | 'restore' | 'clean' | 'status';
+
+export interface ProjectJob {
+  key: string;
+  action: ProjectAction;
+  state: 'running' | 'done' | 'error';
+  last_progress: string | null;
+  message: string | null;
+  started_at: number;
+  finished_at: number | null;
+}
+
+export interface Project {
+  key: string;
+  client: string;
+  game: string;
+  math_id: string;
+  library: string;
+  publish_files: string;
+  bytes_publish: number;
+  bytes_intermediate: number;
+  bytes_intermediate_detail: Record<string, number>;
+  bytes_total: number;
+  has_publish: boolean;
+  /** Unix seconds. */
+  last_modified: number;
+  archived: { remote: string; archived_at: string | number; bytes: number } | null;
+  status: ProjectStatus;
+  running: boolean;
+  slotlab_game: string | null;
+  job: ProjectJob | null;
+}
+
+export interface ProjectList {
+  disk: { total: number; used: number; free: number };
+  remote: string;
+  projects: Project[];
+}
 
 /** Bonus-only draw: the RGS picks among the mode's bonus books, LUT-weighted. */
 export interface PoolSummary {

@@ -3,6 +3,7 @@ import { api } from './api';
 import { storageGet, storageRemove, storageSet } from './storage';
 
 export type Tab =
+  | 'projects'
   | 'games'
   | 'play'
   | 'board'
@@ -20,6 +21,7 @@ export type Tab =
 export type PublishView = 'link' | 'homelab';
 
 const TABS: Tab[] = [
+  'projects',
   'games',
   'play',
   'board',

@@ -14,6 +14,7 @@ mod muted;
 mod optimize;
 mod persist;
 mod preflight;
+mod projects;
 mod registry;
 mod report;
 mod scan;
@@ -165,6 +166,7 @@ pub async fn run_server(opts: ServerOptions) -> anyhow::Result<()> {
         .merge(scan::router())
         .merge(history::router())
         .merge(muted::router())
+        .merge(projects::router())
         .merge(report::router())
         .merge(games_router())
         // RGS émulé aussi sur l'origine de l'UI : ouvert à distance (slotlab.mcberry.fr,

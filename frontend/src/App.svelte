@@ -20,6 +20,7 @@
    * switch never waits on the network in practice. */
   type PageModule = Promise<{ default: Component }>;
   const pageLoaders: Partial<Record<Tab, () => PageModule>> = {
+    projects: () => import('./pages/Projects.svelte'),
     analyze: () => import('./pages/Analyze.svelte'),
     balance: () => import('./pages/Balance.svelte'),
     challenge: () => import('./pages/Challenge.svelte'),
@@ -53,7 +54,13 @@
 
   /** Grouped by the order work happens in: add → play → math → QA → ship. */
   const groups: { label: string; tabs: { id: Tab; label: string; icon: IconName }[] }[] = [
-    { label: 'Setup', tabs: [{ id: 'games', label: 'Games', icon: 'games' }] },
+    {
+      label: 'Setup',
+      tabs: [
+        { id: 'projects', label: 'Projects', icon: 'projects' },
+        { id: 'games', label: 'Games', icon: 'games' },
+      ],
+    },
     {
       label: 'Play',
       tabs: [
@@ -84,6 +91,7 @@
 
   /** One line under each page title: what the page answers. */
   const pageIntro: Record<Tab, string> = {
+    projects: 'Every slot project on the VPS: where its math lives, what it weighs, and what to archive.',
     games: 'The games SlotLab knows: where their books are, and what each mode pays.',
     play: 'Play the build against the emulated RGS, in every screen size at once.',
     board: 'The board the game shows before the first spin: edit it, check it, write it back.',
