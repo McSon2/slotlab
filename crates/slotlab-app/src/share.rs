@@ -184,6 +184,14 @@ async fn only_shared_game(
         if !asked.eq_ignore_ascii_case(&cfg.game) {
             return axum::http::StatusCode::NOT_FOUND.into_response();
         }
+        // ⚠️ jamais en cache (Cloudflare gardait /bet/replay ~30 min : apres une nouvelle prod, les replays
+        // deja ouverts renvoyaient l'ANCIEN book — 2026-11-13)
+        let mut res = next.run(req).await;
+        res.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return res;
     }
     next.run(req).await
 }
